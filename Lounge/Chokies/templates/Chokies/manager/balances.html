@@ -1,0 +1,19 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Stock balances{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Stock balances</h1><p>What is on hand in each location, valued at average cost.</p></div>
+<div class="acts"><a class="btn" href="?{{ qs }}&export=csv">Download CSV</a><button class="btn" onclick="window.print()">Print</button></div></div>
+<form class="filters" method="get">
+  <label>Search<input name="q" value="{{ f.q }}" placeholder="Name or SKU"></label>
+  <label>Location<select name="location"><option value="">All locations</option>{% for l in locations %}<option value="{{ l.pk }}"{% if f.location == l.pk|stringformat:"s" %} selected{% endif %}>{{ l.name }}</option>{% endfor %}</select></label>
+  <label>Category<select name="category"><option value="">All</option>{% for c in categories %}<option{% if f.category == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
+  <label class="chk"><input type="checkbox" name="low" value="1"{% if f.low %} checked{% endif %}> Low stock only</label>
+  <label class="chk"><input type="checkbox" name="hide_zero" value="1"{% if f.hide_zero %} checked{% endif %}> Hide zero</label>
+  <button class="btn">Filter</button><a class="btn" href="{% url 'manager:balances' %}">Clear</a>
+</form>
+<div class="card"><div class="tw"><table>
+<thead><tr><th>Item</th><th>Category</th>{% for l in shown %}<th class="n">{{ l.name }}</th>{% endfor %}<th class="n">Total</th><th class="n">Reorder at</th><th class="n">Avg cost</th><th class="n">Value</th></tr></thead><tbody>
+{% for r in rows %}<tr class="{% if r.out %}out{% elif r.low %}low{% endif %}"><td><a href="{% url 'manager:item_detail' r.item.pk %}">{{ r.item.name }}</a> <small>{{ r.item.stock_unit }}</small></td><td>{{ r.item.category|default:"-" }}</td>
+{% for c in r.cells %}<td class="n">{{ c|floatformat:"-2" }}</td>{% endfor %}<td class="n"><b>{{ r.total|floatformat:"-2" }}</b>{% if r.out %} <span class="pill bad">Out</span>{% elif r.low %} <span class="pill warn">Low</span>{% endif %}</td>
+<td class="n">{{ r.item.reorder_level|floatformat:"-2" }}</td><td class="n">{{ r.item.avg_cost|floatformat:2 }}</td><td class="n">{{ r.value|floatformat:2 }}</td></tr>
+{% empty %}<tr><td colspan="{{ shown|length|add:6 }}" class="empty">No items match.</td></tr>{% endfor %}</tbody>
+<tfoot><tr><td colspan="{{ shown|length|add:5 }}">Stock value</td><td class="n">{{ grand|floatformat:2 }}</td></tr></tfoot></table></div></div>{% endblock %}

@@ -1,0 +1,15 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Stock takes{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Stock takes</h1><p>Count a location, review the variances, then approve to correct the books.</p></div></div>
+<form method="post" class="card form">{% csrf_token %}<h2>Start a stock take</h2>
+<div class="grid2">
+ <label>Location<select name="location">{% for l in locations %}<option value="{{ l.pk }}">{{ l.name }}</option>{% endfor %}</select></label>
+ <label>Items<select name="category"><option value="">Every active item</option>{% for c in categories %}<option>{{ c }}</option>{% endfor %}</select></label>
+ <label>Type<select name="kind"><option value="regular">Regular count (compare with the books)</option><option value="opening">Opening stock (first count, sets quantity and cost)</option></select></label>
+</div>
+<label class="chk"><input type="checkbox" name="blind" value="1" checked> Blind count: hide the expected quantity while counting</label>
+<div><button class="btn primary">Start stock take</button></div></form>
+<div class="card"><h2>All stock takes</h2><div class="tw"><table><thead><tr><th>Number</th><th>Started</th><th>Location</th><th>Type</th><th>Status</th><th>Started by</th><th>Approved by</th></tr></thead><tbody>
+{% for t in page %}<tr><td><a href="{% url 'manager:stock_take' t.pk %}">{{ t.number }}</a></td><td>{{ t.created_at|date:"j M Y H:i" }}</td><td>{{ t.location.name }}</td><td>{% if t.is_opening %}Opening{% else %}Regular{% endif %}{% if t.blind %}, blind{% endif %}</td>
+<td><span class="pill {{ t.status }}">{{ t.get_status_display }}</span></td><td>{{ t.created_by.username }}</td><td>{{ t.approved_by.username|default:"-" }}</td></tr>
+{% empty %}<tr><td colspan="7" class="empty">No stock takes yet.</td></tr>{% endfor %}</tbody></table></div>{% include "Chokies/manager/_pager.html" %}</div>{% endblock %}

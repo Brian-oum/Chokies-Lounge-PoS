@@ -1,0 +1,22 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Receive stock{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Receive stock</h1><p>Book in a delivery against an LPO. Partial deliveries are fine; the LPO stays open until it is complete.</p></div></div>
+{% if po %}
+<div class="card kv"><div><small>LPO</small><b><a href="{% url 'manager:lpo_detail' po.pk %}">{{ po.number }}</a></b></div><div><small>Supplier</small><b>{{ po.supplier.name }}</b></div><div><small>Status</small><b>{{ po.get_status_display }}</b></div></div>
+{% if can_receive %}
+<form method="post" class="form">{% csrf_token %}<input type="hidden" name="po" value="{{ po.pk }}">
+<div class="card"><h2>Delivery</h2><div class="grid2">
+ <label>Receive into<select name="location">{% for l in locations %}<option value="{{ l.pk }}"{% if l == sel_location %} selected{% endif %}>{{ l.name }}</option>{% endfor %}</select></label>
+ <label>Supplier invoice / delivery note no.<input name="invoice_no" value="{{ post.invoice_no }}"></label></div></div>
+<div class="card"><h2>Quantities received</h2><div class="tw"><table><thead><tr><th>Item</th><th class="n">Ordered</th><th class="n">Already received</th><th class="n">Still to come</th><th>Receive now</th><th>Cost per unit</th></tr></thead><tbody>
+{% for x in lines %}<tr><td>{{ x.line.item.name }}</td><td class="n">{{ x.line.qty_ordered|floatformat:"-2" }} {{ x.line.item.purchase_unit }}</td><td class="n">{{ x.line.qty_received|floatformat:"-2" }}</td><td class="n">{{ x.left|floatformat:"-2" }}</td>
+<td>{% if x.left > 0 %}<input name="qty_{{ x.line.pk }}" inputmode="decimal" size="8" value="{{ x.qty }}" aria-label="Quantity received for {{ x.line.item.name }}">{% else %}<small>Complete</small>{% endif %}</td>
+<td>{% if x.left > 0 %}<input name="cost_{{ x.line.pk }}" inputmode="decimal" size="9" value="{{ x.cost }}" placeholder="{{ x.line.unit_cost|floatformat:'-2' }}" aria-label="Cost per unit for {{ x.line.item.name }}">{% endif %}</td></tr>{% endfor %}
+</tbody></table></div><p class="help">Leave the cost blank to use the LPO price. Enter the invoice price if it differs; the average cost follows it.</p></div>
+<div class="acts"><button class="btn primary">Receive into stock</button><a class="btn" href="{% url 'manager:receive' %}">Choose another LPO</a></div></form>
+{% else %}<div class="card empty">This LPO is {{ po.get_status_display|lower }} and cannot take deliveries. <a href="{% url 'manager:receive' %}">Choose another</a>.</div>{% endif %}
+{% else %}
+<div class="card"><h2>LPOs waiting for delivery</h2><div class="tw"><table><thead><tr><th>LPO</th><th>Supplier</th><th>Ordered</th><th>Status</th><th></th></tr></thead><tbody>
+{% for p in waiting %}<tr><td><a href="{% url 'manager:lpo_detail' p.pk %}">{{ p.number }}</a></td><td>{{ p.supplier.name }}</td><td>{{ p.created_at|date:"j M Y" }}</td><td><span class="pill {{ p.status }}">{{ p.get_status_display }}</span></td><td class="n"><a class="btn sm primary" href="?po={{ p.pk }}">Receive</a></td></tr>
+{% empty %}<tr><td colspan="5" class="empty">Nothing is waiting. Send an LPO first, or record a <a href="{% url 'manager:purchase_new' %}">direct purchase</a>.</td></tr>{% endfor %}</tbody></table></div></div>
+{% endif %}{% endblock %}

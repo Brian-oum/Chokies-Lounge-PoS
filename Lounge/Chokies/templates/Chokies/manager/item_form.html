@@ -1,0 +1,15 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}{% if item %}Edit {{ item.name }}{% else %}New item{% endif %}{% endblock %}
+{% block content %}
+<div class="head"><div><h1>{% if item %}Edit {{ item.name }}{% else %}New item{% endif %}</h1>
+<p>Stock is counted in the stock unit, bought in the purchase unit and used by recipes in the recipe unit. Example: buy a crate, count bottles, recipe in ml.</p></div></div>
+<form method="post" class="form">{% csrf_token %}
+{% if form.non_field_errors %}<div class="msgs"><li class="error">{{ form.non_field_errors }}</li></div>{% endif %}
+<div class="card"><h2>Details</h2><div class="grid2">
+{% for f in form %}{% if f.name == "is_active" %}{% else %}<label>{{ f.label }}{{ f }}{{ f.errors }}{% if f.name == "category" %}<span class="help">Pick an existing category or type a new one.</span>{% endif %}</label>{% endif %}{% endfor %}
+</div>
+<datalist id="cats">{% for c in categories %}<option value="{{ c }}">{% endfor %}</datalist>
+<p><label class="chk">{{ form.is_active }} {{ form.is_active.label }}</label></p></div>
+{% if item %}<p class="help">Average cost ({{ item.avg_cost|floatformat:2 }} per {{ item.stock_unit }}) is worked out from purchases and cannot be edited here.</p>{% endif %}
+<div class="acts"><button class="btn primary">{% if item %}Save changes{% else %}Add item{% endif %}</button><a class="btn" href="{% if item %}{% url 'manager:item_detail' item.pk %}{% else %}{% url 'manager:items' %}{% endif %}">Cancel</a></div>
+</form>
+<script>document.querySelector('[name=category]')?.setAttribute('list','cats')</script>{% endblock %}

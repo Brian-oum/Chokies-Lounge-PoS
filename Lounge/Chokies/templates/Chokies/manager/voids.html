@@ -1,0 +1,22 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Voids{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Voids</h1><p>Cancel items that were sent to the kitchen or bar. Choose whether the stock goes back or counts as waste.</p></div></div>
+<form class="filters" method="get"><label>Find an order<input name="q" value="{{ f.q }}" placeholder="Order, table, waiter or item"></label><button class="btn">Search</button><a class="btn" href="{% url 'manager:voids' %}">Clear</a></form>
+<div class="card"><h2>Items you can void</h2>
+{% for o in orders %}<div class="rowline">
+ <div class="grow"><b>{{ o.number }}</b> <span class="muted">{% if o.table %}{{ o.table.name }}{% elif o.room_number %}Room {{ o.room_number }}{% elif o.source == "BAR" %}Bar{% else %}No table{% endif %}, waiter {{ o.waiter.get_full_name|default:o.waiter.username }}, {{ o.created_at|date:"H:i" }}</span></div>
+ <div class="tw"><table><tbody>{% for i in o.sent_items %}<tr><td>{{ i.quantity }} x {{ i.name }}{% if i.notes %} <small>({{ i.notes }})</small>{% endif %}</td><td class="n">{{ i.line_total|floatformat:2 }}</td>
+ <td class="n"><details class="act"><summary class="btn sm danger">Void</summary>
+  <form method="post" action="{% url 'manager:void_item' i.pk %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}">
+   <input name="reason" placeholder="Reason (required)" required>
+   <label class="chk"><input type="radio" name="wasted" value="0" checked> Not made: return the stock</label>
+   <label class="chk"><input type="radio" name="wasted" value="1"> Already made: count as waste</label>
+   <button class="btn sm danger">Void {{ i.name }}</button></form></details></td></tr>{% endfor %}</tbody></table></div></div>
+{% empty %}<p class="empty">No open orders have sent items to void.</p>{% endfor %}</div>
+<div class="card"><h2>Billed, not yet paid</h2><p class="help">A billed order is locked. Cancel the bill to reopen the order, then void items above and bill it again.</p>
+{% for b in billed %}<div class="rowline"><span><b>{{ b.number }}</b> for {{ b.order.number }} <span class="muted">{% if b.order.table %}{{ b.order.table.name }}, {% endif %}{{ b.total|floatformat:2 }}</span></span><span class="grow"></span>
+ {% if b.amount_paid %}<small>Part-paid: refund first</small>{% else %}<details class="act"><summary class="btn sm danger">Cancel bill</summary><form method="post" action="{% url 'manager:cancel_bill' b.pk %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}"><input name="reason" placeholder="Reason (required)" required><button class="btn sm danger">Cancel {{ b.number }}</button></form></details>{% endif %}</div>
+{% empty %}<p class="empty">No unpaid bills.</p>{% endfor %}</div>
+<div class="card"><h2>Recent voids and cancelled bills</h2><div class="tw"><table><thead><tr><th>When</th><th>What</th><th>Order / bill</th><th class="n">Amount</th><th>Reason</th><th>Approved by</th></tr></thead><tbody>
+{% for l in logs %}<tr><td>{{ l.created_at|date:"j M H:i" }}</td><td>{% if l.action == "item_voided" %}{{ l.details.qty }} x {{ l.details.item }}{% if l.details.wasted %} <span class="pill warn">Waste</span>{% endif %}{% else %}Bill cancelled{% endif %}</td><td>{{ l.what|default:"-" }}</td><td class="n">{{ l.details.amount|default:"-" }}</td><td class="wrap">{{ l.details.reason }}</td><td>{{ l.user.username|default:"-" }}</td></tr>
+{% empty %}<tr><td colspan="6" class="empty">Nothing voided yet.</td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}

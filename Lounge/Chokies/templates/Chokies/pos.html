@@ -1,0 +1,231 @@
+{% load static %}<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nova PoS</title>
+<link rel="stylesheet" href="{% static 'css/pos.css' %}"></head>
+<body data-role="waiter">
+{% csrf_token %}{{ pos_user|json_script:"pos-user" }}
+
+<!-- payment icons: card / M-Pesa marks are simplified; swap in the official artwork from each brand's asset portal if you need exact logos -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-visa" viewBox="0 0 48 32"><rect x=".5" y=".5" width="47" height="31" rx="5" fill="#fff" stroke="#d5dbe0"/><text x="24" y="21.5" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="800" font-style="italic" font-size="14" fill="#1a1f71">VISA</text></symbol>
+  <symbol id="i-mc" viewBox="0 0 48 32"><rect x=".5" y=".5" width="47" height="31" rx="5" fill="#fff" stroke="#d5dbe0"/><circle cx="19" cy="16" r="9" fill="#eb001b"/><circle cx="29" cy="16" r="9" fill="#f79e1b"/><path d="M24 8.52a9 9 0 0 1 0 14.96a9 9 0 0 1 0-14.96z" fill="#ff5f00"/></symbol>
+  <symbol id="i-amex" viewBox="0 0 48 32"><rect width="48" height="32" rx="5" fill="#006fcf"/><text x="24" y="20.5" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="800" font-size="10.5" letter-spacing=".5" fill="#fff">AMEX</text></symbol>
+  <symbol id="i-mpesa" viewBox="0 0 48 32"><rect width="48" height="32" rx="5" fill="#43b02a"/><text x="24" y="20.5" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="800" font-size="11.5" fill="#fff">M-PESA</text></symbol>
+  <symbol id="i-cash" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2.7"/><path d="M5.8 9.5h.01M18.2 14.5h.01" stroke-width="2.4"/></symbol>
+  <symbol id="i-voucher" viewBox="0 0 24 24"><path d="M3 8a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v2a2 2 0 0 0 0 4v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-2a2 2 0 0 0 0-4z"/><path d="M14.5 7v10" stroke-dasharray="1.6 2.2"/></symbol>
+  <symbol id="i-card" viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20M6 15h4"/></symbol>
+  <symbol id="i-bank" viewBox="0 0 24 24"><path d="M3 10l9-6 9 6zM5.5 10v8M9.8 10v8M14.2 10v8M18.5 10v8M3 20h18"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18.5h2"/></symbol>
+  <symbol id="i-till" viewBox="0 0 24 24"><path d="M4 9h16l-1.2-4.5H5.2zM5 9v10h14V9M9.5 19v-5h5v5"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 4.5h18l-7 8.2V19l-4 2v-8.3z" fill="currentColor" stroke="none"/></symbol>
+</svg>
+
+<!-- ============ LOGIN ============ -->
+<section id="login" class="login hidden"><div class="login-card">
+  <div class="brand big"><span class="logo">C</span><div><b>Nova PoS</b><small>Sign in with your PIN</small></div></div>
+  <div id="roster" class="roster"></div>
+  <input id="uname" placeholder="Username" autocomplete="username" autocapitalize="none">
+  <div id="dots" class="dots"></div><div id="loginErr" class="err" role="alert"></div>
+  <div id="pad" class="pad"></div>
+  <p class="hint">Waiters and cashiers appear above while their shift is open. Managers: type your username.</p>
+</div></section>
+
+<!-- ============ TOP BAR + MAIN NAV (tabs depend on the role; built in pos.js buildNav) ============ -->
+<header class="top">
+  <div class="brand"><span class="logo">C</span><b>Nova PoS</b></div>
+  <span class="grow"></span>
+  <span id="clock" class="clock"></span>
+  <div class="profile">
+    <button id="profileBtn" type="button" class="pbtn" aria-haspopup="menu" aria-expanded="false" aria-controls="profileMenu">
+      <b id="whoName"></b><span id="avatar" class="avatar"></span>
+      <svg class="caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5z"/></svg>
+    </button>
+    <div id="profileMenu" class="pmenu hidden" role="menu">
+      <div class="pm-head"><span id="avatarBig" class="avatar lg"></span><div><b id="pmName"></b><small id="whoRole"></small></div></div>
+      <div class="pm-row"><span>Shift</span><span id="shiftChip" class="chip"></span></div>
+      <div class="pm-row"><span id="cashLabel">Collected</span><span id="cashChip" class="chip money"></span></div>
+      <div class="pm-actions"><button id="endShift" type="button" class="btn ghost sm">End shift</button><button id="signOut" type="button" class="btn danger sm">Sign out</button></div>
+    </div>
+  </div>
+</header>
+<nav id="mainNav" class="navbar" aria-label="Main"></nav>
+<div id="notice" class="notice hidden">You are signed in without a shift. Create shifts in the admin site; orders and payments need an assigned shift.</div>
+
+<!-- ============ MAIN ============ -->
+<main id="app" class="layout hidden">
+
+  <!-- cashier: order / paid list -->
+  <aside class="col orders c-only">
+    <div class="panelhead"><div><h3 id="cTitle">Orders</h3><small id="cSum"></small></div><i id="cCount" class="badge"></i></div>
+    <div class="seg" id="filterSeg"><button data-f="ACTIVE" class="on">Open</button><button data-f="SENT">To bill</button><button data-f="BILLED">Billed</button><button data-f="PAID">Paid</button></div>
+    <div id="waiterBar" class="wbar"></div>
+    <div id="orderList" class="olist"></div>
+  </aside>
+
+  <!-- waiter: home (centre) -->
+  <section id="home" class="home w-only">
+    <div class="hero">
+      <div><h1 id="greet"></h1><p id="greetSub" class="muted"></p></div>
+    </div>
+    <h2 class="sech">Start an order</h2>
+    <div id="spGrid" class="spgrid"></div>
+  </section>
+
+  <!-- waiter: open orders (right, only when there are some) -->
+  <aside id="openPanel" class="col openpanel w-only hidden">
+    <div class="panelhead"><div><h3>Open orders</h3><small id="openSum"></small></div><i id="openCount" class="badge"></i></div>
+    <div id="openList" class="olist"></div>
+  </aside>
+
+  <!-- Open orders (waiter + cashier) and Paid bills (cashier) pages: replace the home / desk while their tab is selected -->
+  <section id="ordersPage" class="opage" aria-labelledby="opTitle">
+    <div class="pcard filters">
+      <p class="pc-cap">Filter by date range</p>
+      <div class="frow">
+        <label>Selling point <span class="req">*</span><select id="fSp"></select></label>
+        <label class="c-only">Waiter<select id="fWaiter"></select></label>
+        <label><span><span id="fStatusLbl">Order option</span> <span class="req">*</span></span><select id="fStatus"></select></label>
+        <label>From date <span class="req">*</span><input id="fFrom" type="date"></label>
+        <label>To date <span class="req">*</span><input id="fTo" type="date"></label>
+        <button id="fGo" type="button" class="btn outline">Filter <svg class="gl fill" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-filter"/></svg></button>
+      </div>
+    </div>
+    <div class="pcard tablecard">
+      <div class="pc-head"><h2 id="opTitle">Open orders</h2><div id="opNew" class="pc-actions w-only"></div></div>
+      <div class="pc-tools">
+        <label>Show <select id="opSize"><option>10</option><option>25</option><option>50</option><option>100</option></select> entries</label>
+        <label>Search: <input id="opSearch" type="search" autocomplete="off"></label>
+      </div>
+      <div class="tablewrap2"><table class="dtable otable"><thead id="opHead"></thead><tbody id="opBody"></tbody><tfoot id="opFoot"></tfoot></table></div>
+      <div class="pc-foot"><span id="opInfo" class="muted"></span><div id="opPager" class="pager"></div></div>
+    </div>
+  </section>
+
+  <!-- Order page: a full page (like an invoice) for one order or paid bill. Opened from any order / bill link; the URL becomes #/order/<id>.
+       Filled in by renderOrderPage() in pos.js. -->
+  <section id="orderPage" class="ipage" aria-label="Order details">
+    <div class="ibar">
+      <div class="ibar-top"><button id="ipBack" type="button" class="btn ghost sm">← Back</button><span class="grow"></span><small id="ipPrepared"></small></div>
+      <div id="ipActions" class="ip-actions"></div>
+    </div>
+    <article id="ipBody" class="pcard inv"></article>
+  </section>
+
+  <!-- ticket: the cashier's inline order panel on the desk (hidden for waiters, who use the order page below) -->
+  <section id="ticket" class="col ticket empty">
+    <div class="thead"><div class="tid"><h2 id="tTitle">No order selected</h2><div id="tSub" class="tmeta"></div></div><span id="tStatus" class="pill"></span></div>
+    <div id="tNote" class="tnote hidden"></div>
+    <div class="lhead"><span id="lCount"></span><button id="addItems" type="button" class="btn sm hidden">+ Add items</button></div>
+    <div id="lines" class="lines"></div>
+    <div class="tfoot">
+      <dl class="totals"><dt>Subtotal</dt><dd id="vSub">0.00</dd><dt>VAT</dt><dd id="vTax">0.00</dd><dt class="grand">Total</dt><dd id="vTot" class="grand">0.00</dd></dl>
+      <div id="actions" class="actions"></div>
+    </div>
+  </section>
+
+  <!-- cashier: drawer -->
+  <aside id="drawerCol" class="col drawer c-only">
+    <div class="panelhead"><div><h3>My cash drawer</h3><small id="drawerSub"></small></div></div><div id="drawerBox" class="dbox"></div>
+    <div class="row2"><button id="cashIn" class="btn ghost">Cash in</button><button id="cashOut" class="btn ghost">Cash out</button></div>
+  </aside>
+</main>
+
+<!-- ============ DIALOGS ============ -->
+<!-- waiter: My sales / Open orders tables (one dialog, two views) -->
+<dialog id="dataDlg" class="ddlg" aria-labelledby="dTitle">
+  <header class="ohead"><div><h3 id="dTitle"></h3><small id="dSub" class="muted"></small></div><button id="dClose" type="button" class="btn ghost sm">✕ Close</button></header>
+  <div id="dStats" class="dstats"></div>
+  <div class="dtools"><input id="dSearch" class="search" type="search" placeholder="Search…" autocomplete="off"></div>
+  <div class="tablewrap"><table class="dtable"><thead id="dHead"></thead><tbody id="dBody"></tbody><tfoot id="dFoot"></tfoot></table></div>
+</dialog>
+
+<!-- generic prompt (see ask() in core.js) -->
+<dialog id="dlg"><form method="dialog"><h3 id="dlgTitle"></h3><div id="dlgBody" class="fields"></div>
+  <div class="row2"><button value="cancel" class="btn ghost" formnovalidate>Cancel</button><button id="dlgOk" value="ok" class="btn primary">Confirm</button></div></form></dialog>
+
+<!-- new order / add items -->
+<dialog id="orderDlg" class="odlg">
+  <header class="ohead"><div><h3 id="oTitle">New order</h3><small id="oSub" class="muted"></small></div>
+    <button id="oClose" type="button" class="btn ghost sm">✕ Close</button></header>
+  <div class="obody">
+    <section class="oform">
+      <div class="osell">Selling from: <b id="oFrom"></b> <small class="muted">· you can add items from both selling points</small></div>
+      <div class="olinesh"><span>Item</span><span>Qty</span><span>Price</span><span>Subtotal</span><span></span></div>
+      <div id="oLines" class="olines"></div>
+      <div class="otot"><label>Tax (VAT)<output id="oTax">0.00</output></label><label>Total<output id="oTot" class="big">0.00</output></label></div>
+      <div id="oMeta" class="ometa">
+        <label>Table (optional)<select id="oTable"></select></label>
+        <label>Room number (room service)<input id="oRoom" maxlength="10" placeholder="e.g. 204" autocomplete="off"></label>
+        <label class="wide">Notes<textarea id="oNotes" maxlength="300" rows="2" placeholder="Write some notes here…"></textarea></label>
+      </div>
+      <div class="ofoot"><p id="oHint" class="ohint"></p><button id="oCreate" type="button" class="btn primary">Create order</button></div>
+    </section>
+    <section class="omenu">
+      <div class="sptabs" id="oSp" role="tablist" aria-label="Selling point"></div>
+      <input id="q" class="search" placeholder="Search item here…" autocomplete="off">
+      <div id="cats" class="cats"></div>
+      <div id="menu" class="mgrid"></div>
+    </section>
+  </div>
+</dialog>
+
+<dialog id="doneDlg"><form method="dialog"><h3>Payment complete</h3><p id="doneMsg" class="due"></p>
+  <div class="row2"><button value="done" class="btn ghost">Done</button><button value="print" class="btn primary">Print receipt</button></div></form></dialog>
+
+<dialog id="payDlg" class="paydlg"><form method="dialog" id="payForm">
+  <div class="phd"><h3>Take payment</h3><p class="due">Balance due <b id="payBal"></b></p></div>
+  <div id="methods" class="methods" aria-label="Payment method">
+    <button type="button" data-m="CASH" class="on"><span class="mi"><svg class="gl" aria-hidden="true"><use href="#i-cash"/></svg></span>Cash</button>
+    <button type="button" data-m="MOBILE_MONEY"><span class="mi"><svg class="brand" aria-hidden="true"><use href="#i-mpesa"/></svg></span>M-Pesa</button>
+    <button type="button" data-m="CARD"><span class="mi duo"><svg class="brand" aria-hidden="true"><use href="#i-visa"/></svg><svg class="brand" aria-hidden="true"><use href="#i-mc"/></svg></span>Card</button>
+    <button type="button" data-m="VOUCHER"><span class="mi"><svg class="gl" aria-hidden="true"><use href="#i-voucher"/></svg></span>Voucher</button>
+  </div>
+  <div class="fields">
+    <label>Amount (KSh)<input id="payAmt" type="number" step="0.01" inputmode="decimal"></label>
+
+    <div id="cashBox" class="pane">
+      <label>Cash received<input id="payTen" type="number" step="0.01" inputmode="decimal"></label>
+      <div id="quick" class="quick"></div><p class="due">Change <b id="payChg">0.00</b></p>
+    </div>
+
+    <div id="mpBox" class="pane hidden">
+      <div id="mpMode" class="subseg">
+        <button type="button" data-mp="STK"><svg class="gl" aria-hidden="true"><use href="#i-phone"/></svg>STK push</button>
+        <button type="button" data-mp="TILL"><svg class="gl" aria-hidden="true"><use href="#i-till"/></svg>Till number</button>
+      </div>
+      <div id="mpStk" class="pane">
+        <label>Customer's M-Pesa number<input id="stkPhone" type="tel" inputmode="tel" placeholder="07XX XXX XXX" autocomplete="off"></label>
+        <button type="button" id="stkSend" class="btn primary">Send STK push</button>
+        <div id="stkStatus" class="stkstat hidden" role="status" aria-live="polite"></div>
+      </div>
+      <div id="mpTill" class="pane hidden">
+        <div class="acct"><div><small>Buy Goods till number</small><b id="tillNo" class="acct-no"></b></div><button type="button" class="btn ghost sm" data-copy="tillNo">Copy</button></div>
+        <p class="fnote">Ask the customer to pay the amount above to this till, then enter the confirmation code from their M-Pesa SMS.</p>
+        <label>M-Pesa confirmation code<input id="tillRef" maxlength="10" placeholder="e.g. UJ12AB3CDE" autocapitalize="characters" autocomplete="off" spellcheck="false"></label>
+      </div>
+    </div>
+
+    <div id="cardBox" class="pane hidden">
+      <div class="brands" aria-label="Accepted cards"><svg class="brand" aria-hidden="true"><use href="#i-visa"/></svg><svg class="brand" aria-hidden="true"><use href="#i-mc"/></svg><svg class="brand" aria-hidden="true"><use href="#i-amex"/></svg></div>
+      <div id="cardMode" class="subseg">
+        <button type="button" data-cm="CARD"><svg class="gl" aria-hidden="true"><use href="#i-card"/></svg>Card machine</button>
+        <button type="button" data-cm="TRANSFER"><svg class="gl" aria-hidden="true"><use href="#i-bank"/></svg>Bank transfer</button>
+      </div>
+      <div id="trfBox" class="pane hidden">
+        <div class="acct-rows">
+          <div><small>Bank</small><b id="bkName"></b></div>
+          <div><small>Account name</small><b id="bkAccName"></b></div>
+          <div class="acct"><div><small>Account number</small><b id="bkAccNo" class="acct-no"></b></div><button type="button" class="btn ghost sm" data-copy="bkAccNo">Copy</button></div>
+        </div>
+      </div>
+      <label><span id="cardRefLbl">Card slip / approval code</span><input id="cardRef" autocomplete="off"></label>
+    </div>
+
+    <div id="vchBox" class="pane hidden"><label>Voucher code (optional)<input id="vchRef" autocomplete="off"></label></div>
+  </div>
+  <div class="row2"><button value="cancel" class="btn ghost">Cancel</button><button type="button" id="payOk" class="btn success">Confirm payment</button></div></form></dialog>
+
+<div id="toasts" class="toasts" popover="manual" aria-live="polite"></div>
+
+<script src="{% static 'js/pos.js' %}"></script>
+</body></html>

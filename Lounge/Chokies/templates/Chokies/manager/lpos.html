@@ -1,0 +1,26 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}LPOs{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Local purchase orders</h1><p>Orders placed with suppliers. Send them, receive deliveries against them, or cancel.</p></div>
+<div class="acts"><a class="btn primary" href="{% url 'manager:lpo_new' %}">New LPO</a></div></div>
+<form class="filters" method="get">
+  <label>Search<input name="q" value="{{ f.q }}" placeholder="LPO number or supplier"></label>
+  <label>Status<select name="status"><option value="">All</option>{% for v, l in statuses %}<option value="{{ v }}"{% if f.status == v %} selected{% endif %}>{{ l }}</option>{% endfor %}</select></label>
+  <label>Supplier<select name="supplier"><option value="">All</option>{% for s in suppliers %}<option value="{{ s.pk }}"{% if f.supplier == s.pk|stringformat:"s" %} selected{% endif %}>{{ s.name }}</option>{% endfor %}</select></label>
+  <label>From<input type="date" name="from" value="{{ f.from }}"></label><label>To<input type="date" name="to" value="{{ f.to }}"></label>
+  <button class="btn">Filter</button><a class="btn" href="{% url 'manager:lpos' %}">Clear</a>
+</form>
+<div class="card"><div class="tw"><table>
+<thead><tr><th>LPO</th><th>Date</th><th>Supplier</th><th>Status</th><th class="n">Delivered</th><th class="n">Value</th><th>Actions</th></tr></thead><tbody>
+{% for po in page %}<tr>
+ <td><a href="{% url 'manager:lpo_detail' po.pk %}">{{ po.number }}</a></td><td>{{ po.created_at|date:"j M Y" }}</td><td>{{ po.supplier.name }}</td>
+ <td><span class="pill {{ po.status }}">{{ po.get_status_display }}</span></td><td class="n">{{ po.pct }}%</td><td class="n">{{ po.value|floatformat:2 }}</td>
+ <td><div class="row-acts">
+  <a class="btn sm" href="{% url 'manager:lpo_detail' po.pk %}">View</a>
+  {% if po.status == "DRAFT" %}<form method="post" action="{% url 'manager:lpo_action' po.pk 'send' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}"><button class="btn sm primary">Mark as sent</button></form>{% endif %}
+  {% if po.status == "SENT" or po.status == "PARTIAL" %}<a class="btn sm primary" href="{% url 'manager:receive' %}?po={{ po.pk }}">Receive</a>{% endif %}
+  {% if po.status == "DRAFT" or po.status == "SENT" %}<details class="act"><summary class="btn sm danger">Cancel</summary><form method="post" action="{% url 'manager:lpo_action' po.pk 'cancel' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}"><input name="reason" placeholder="Reason" required><button class="btn sm danger">Cancel {{ po.number }}</button></form></details>{% endif %}
+  {% if po.status == "PARTIAL" %}<details class="act"><summary class="btn sm">Close</summary><form method="post" action="{% url 'manager:lpo_action' po.pk 'close' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}"><input name="reason" placeholder="Why no more deliveries?" required><button class="btn sm">Close {{ po.number }}</button></form></details>{% endif %}
+ </div></td></tr>
+{% empty %}<tr><td colspan="7" class="empty">No LPOs match.</td></tr>{% endfor %}</tbody></table></div>
+{% include "Chokies/manager/_pager.html" %}</div>
+{% endblock %}

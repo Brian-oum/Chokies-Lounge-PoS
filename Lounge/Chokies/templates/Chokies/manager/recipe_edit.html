@@ -1,0 +1,123 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Recipe: {{ dish.name }}{% endblock %}
+{% block content %}
+<div class="head"><div><h1>{{ dish.name }}</h1><p>{{ dish.category.name }} &middot; {{ dish.get_station_display }} &middot; sells at {{ dish.price|floatformat:2 }}. List what <b>one portion</b> uses, in each ingredient's recipe unit (ml, g, portion...).</p></div>
+ <a class="btn" href="{% url 'manager:recipes' %}">All recipes</a></div>
+
+{% if copied %}<div class="card"><b>Copied from {{ copied.name }}.</b> <span class="muted">Adjust the amounts, then press Save. Nothing is stored until you do.</span></div>{% endif %}
+
+<form method="post" class="form">{% csrf_token %}
+<div class="rc-stats" id="rc-sum" data-net="{{ net }}" data-target="{{ target }}">
+ <div class="rc-stat"><small>Price{% if includes_tax %} (without tax){% endif %}</small><b>{{ net|floatformat:2 }}</b></div>
+ <div class="rc-stat"><small>Cost per portion</small><b id="rc-cost">0.00</b></div>
+ <div class="rc-stat"><small>Profit per portion</small><b id="rc-profit">-</b></div>
+ <div class="rc-stat" id="rc-margin-tile"><small>Margin (target {{ target|floatformat:"-1" }}%)</small><b id="rc-margin">-</b></div>
+ <div class="rc-stat"><small>Food cost</small><b id="rc-food">-</b></div>
+</div>
+
+<div class="card"><h2>Ingredients</h2>
+ <div class="tw"><table class="rc-table rc-lines">
+  <thead><tr><th>Ingredient</th><th>Quantity per portion</th><th class="num">Cost</th><th></th></tr></thead>
+  <tbody id="rc-body"></tbody>
+ </table></div>
+ <noscript><p class="rc-note bad">This page needs JavaScript to add ingredient lines.</p></noscript>
+ <p><button type="button" id="rc-add" class="btn sm">Add an ingredient</button></p>
+ <p class="rc-note" id="rc-dup" hidden></p>
+ <p class="rc-note warn" id="rc-warn" hidden></p>
+</div>
+
+<div class="card"><label class="rc-track"><input type="checkbox" name="track_stock"{% if track %} checked{% endif %}>
+ <span><b>Deduct these ingredients when this item is sold</b><small>Turn it off for items you do not want stock-tracked (a recipe saved with tracking off deducts nothing).</small></span></label></div>
+
+<div class="acts"><button class="btn primary">Save recipe</button></div></form>
+
+{% if others %}<form method="get" class="card rc-copy"><b>Start from another dish</b>
+ <select name="copy" aria-label="Copy ingredients from">{% for o in others %}<option value="{{ o.pk }}">{{ o.name }} ({{ o.category.name }})</option>{% endfor %}</select>
+ <button class="btn sm">Copy its ingredients</button>
+ <span class="muted">Replaces the lines above with that recipe so you can adjust it. Unsaved changes on this page are lost.</span></form>{% endif %}
+
+{{ item_data|json_script:"item-data" }}{{ rows|json_script:"rows-data" }}
+{% endblock %}
+{% block scripts %}<script>(function () {
+  const items = JSON.parse(document.getElementById('item-data').textContent);
+  const initial = JSON.parse(document.getElementById('rows-data').textContent);
+  const byId = Object.fromEntries(items.map(i => [String(i.id), i]));
+  const sum = document.getElementById('rc-sum');
+  const net = parseFloat(sum.dataset.net), target = parseFloat(sum.dataset.target);
+  const body = document.getElementById('rc-body');
+  const $ = id => document.getElementById(id);
+  const money = n => n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+  function make(tag, props, kids) {
+    const e = Object.assign(document.createElement(tag), props || {});
+    (kids || []).forEach(k => e.appendChild(k));
+    return e;
+  }
+
+  function addRow(r) {
+    const sel = make('select', {name: 'item'}, [make('option', {value: '', textContent: 'Choose an ingredient'})]);
+    items.forEach(i => sel.appendChild(make('option', {value: String(i.id), textContent: i.label})));
+    sel.value = r ? r.item : '';
+    const qty = make('input', {name: 'qty', type: 'number', step: 'any', min: '0', inputMode: 'decimal', value: r ? r.qty : ''});
+    qty.setAttribute('aria-label', 'Quantity per portion');
+    const unit = make('span', {className: 'rc-unit'});
+    const cost = make('td', {className: 'num', textContent: '-'});
+    const x = make('button', {type: 'button', className: 'btn sm x', textContent: '\u00d7'});
+    x.setAttribute('aria-label', 'Remove this line');
+    const tr = make('tr', {}, [
+      make('td', {}, [sel]),
+      make('td', {}, [make('div', {className: 'qtycell'}, [qty, unit])]),
+      cost,
+      make('td', {className: 'num'}, [x])
+    ]);
+    tr._ = {sel, qty, unit, cost};
+    x.addEventListener('click', () => {
+      if (body.rows.length > 1) tr.remove(); else {sel.value = ''; qty.value = '';}
+      recalc();
+    });
+    body.appendChild(tr);
+    return tr;
+  }
+
+  function recalc() {
+    let total = 0;
+    const count = {}, free = [];
+    [...body.rows].forEach(tr => {
+      const i = byId[tr._.sel.value], q = parseFloat(tr._.qty.value);
+      tr._.unit.textContent = i ? i.runit : '';
+      let line = null;
+      if (i && q > 0) {
+        line = q / parseFloat(i.factor) * parseFloat(i.cost);
+        total += line;
+        if (!(parseFloat(i.cost) > 0) && !free.includes(i.label)) free.push(i.label);
+      }
+      tr._.cost.textContent = line === null ? '-' : money(line);
+      if (i) count[i.id] = (count[i.id] || 0) + 1;
+    });
+    const dups = [];
+    [...body.rows].forEach(tr => {
+      const i = byId[tr._.sel.value], d = !!i && count[i.id] > 1;
+      tr.classList.toggle('dup', d);
+      if (d && !dups.includes(i.label)) dups.push(i.label);
+    });
+    const profit = net - total, margin = net > 0 ? profit / net * 100 : null;
+    $('rc-cost').textContent = money(total);
+    $('rc-profit').textContent = total > 0 ? money(profit) : '-';
+    $('rc-margin').textContent = total > 0 && margin !== null ? margin.toFixed(1) + '%' : '-';
+    $('rc-food').textContent = total > 0 && net > 0 ? (total / net * 100).toFixed(1) + '%' : '-';
+    const tile = $('rc-margin-tile');
+    tile.classList.remove('ok', 'bad');
+    if (total > 0 && margin !== null) tile.classList.add(margin >= target ? 'ok' : 'bad');
+    const dup = $('rc-dup'), warn = $('rc-warn');
+    dup.hidden = !dups.length;
+    dup.className = 'rc-note bad';
+    dup.textContent = dups.length ? dups.join(', ') + ' appears on more than one line. Combine them into one line before saving.' : '';
+    warn.hidden = !free.length;
+    warn.textContent = free.length ? 'No cost recorded yet for ' + free.join(', ') + ', so it counts as 0 until it is purchased or counted into stock.' : '';
+  }
+
+  body.addEventListener('change', recalc);
+  body.addEventListener('input', recalc);
+  $('rc-add').addEventListener('click', () => {addRow(null).querySelector('select').focus(); recalc();});
+  (initial.length ? initial : [null]).forEach(addRow);
+  recalc();
+})();</script>{% endblock %}

@@ -1,0 +1,13 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}New LPO{% endblock %}
+{% block content %}
+<div class="head"><div><h1>New LPO</h1><p>Order from a supplier now; receive the delivery later under Receive stock.</p></div></div>
+<form method="post" class="form">{% csrf_token %}
+<div class="card"><h2>Supplier</h2><div class="grid2">
+  <label>Supplier<select name="supplier"><option value="">Choose a supplier</option>{% for s in suppliers %}<option value="{{ s.pk }}"{% if post.supplier == s.pk|stringformat:"s" %} selected{% endif %}>{{ s.name }}</option>{% endfor %}</select></label>
+  <label>Or a new supplier<input name="new_supplier" value="{{ post.new_supplier }}" placeholder="Name"></label>
+  <label>New supplier phone<input name="new_supplier_phone" value="{{ post.new_supplier_phone }}"></label>
+  <label>Notes<input name="notes" value="{{ post.notes }}" placeholder="Delivery instructions, terms"></label></div></div>
+<div class="card"><h2>Items to order</h2>{% include "Chokies/manager/_lines.html" with cost=True %}</div>
+<div class="acts"><button class="btn primary" name="then" value="send">Save and mark as sent</button><button class="btn" name="then" value="draft">Save as draft</button><a class="btn" href="{% url 'manager:lpos' %}">Cancel</a></div>
+</form>{% endblock %}
+{% block scripts %}{% load static %}<script src="{% static 'js/manager.js' %}"></script>{% endblock %}

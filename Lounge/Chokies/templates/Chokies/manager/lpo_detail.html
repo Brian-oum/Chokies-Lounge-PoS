@@ -1,0 +1,15 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}{{ po.number }}{% endblock %}
+{% block content %}
+<div class="head"><div><h1>{{ po.number }} <span class="pill {{ po.status }}">{{ po.get_status_display }}</span></h1><p>To {{ po.supplier.name }}{% if po.supplier.phone %}, {{ po.supplier.phone }}{% endif %}</p></div>
+<div class="acts"><button class="btn" onclick="window.print()">Print</button>
+{% if po.status == "DRAFT" %}<form method="post" action="{% url 'manager:lpo_action' po.pk 'send' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn primary">Mark as sent</button></form>{% endif %}
+{% if can_receive %}<a class="btn primary" href="{% url 'manager:receive' %}?po={{ po.pk }}">Receive stock</a>{% endif %}
+<a class="btn" href="{% url 'manager:lpos' %}">Back to LPOs</a></div></div>
+<div class="card kv"><div><small>Created</small><b>{{ po.created_at|date:"j M Y H:i" }}</b></div><div><small>By</small><b>{{ po.created_by.get_full_name|default:po.created_by.username }}</b></div>
+<div><small>Order value</small><b>{{ total|floatformat:2 }}</b></div>{% if po.notes %}<div><small>Notes</small><b style="white-space:pre-line">{{ po.notes }}</b></div>{% endif %}</div>
+<div class="card"><h2>Lines</h2><div class="tw"><table><thead><tr><th>Item</th><th class="n">Ordered</th><th class="n">Received</th><th class="n">Still to come</th><th class="n">Cost each</th><th class="n">Value</th></tr></thead><tbody>
+{% for x in lines %}<tr><td>{{ x.line.item.name }}</td><td class="n">{{ x.line.qty_ordered|floatformat:"-2" }} {{ x.line.item.purchase_unit }}</td><td class="n">{{ x.line.qty_received|floatformat:"-2" }}</td><td class="n">{{ x.left|floatformat:"-2" }}</td><td class="n">{{ x.line.unit_cost|floatformat:2 }}</td><td class="n">{{ x.value|floatformat:2 }}</td></tr>{% endfor %}
+</tbody><tfoot><tr><td colspan="5">Total</td><td class="n">{{ total|floatformat:2 }}</td></tr></tfoot></table></div></div>
+<div class="card noprint"><h2>Deliveries</h2>{% if receipts %}<div class="tw"><table><thead><tr><th>Receipt</th><th>Date</th><th>Into</th><th>Invoice</th><th class="n">Value</th></tr></thead><tbody>
+{% for r in receipts %}<tr><td><a href="{% url 'manager:purchase_detail' r.pk %}">{{ r.number }}</a></td><td>{{ r.created_at|date:"j M Y H:i" }}</td><td>{{ r.location.name }}</td><td>{{ r.invoice_no|default:"-" }}</td><td class="n">{{ r.value|floatformat:2 }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Nothing delivered yet.</p>{% endif %}</div>
+{% endblock %}

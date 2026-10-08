@@ -1,0 +1,6 @@
+<tr>
+  <td><select name="item" class="pick" aria-label="Item"><option value="">Choose an item</option>{% for i in items %}<option value="{{ i.id }}"{% if r and r.item == i.id|stringformat:"s" %} selected{% endif %}>{{ i.label }}</option>{% endfor %}</select><div class="avail"></div></td>
+  <td><input class="qty" name="qty" inputmode="decimal" aria-label="Quantity" value="{{ r.qty|default:'' }}"><small class="unit"></small></td>
+  {% if cost %}<td><input class="cost" name="cost" inputmode="decimal" aria-label="Cost per unit" value="{{ r.cost|default:'' }}"></td>{% endif %}
+  <td class="x-cell"><button type="button" class="btn sm x" aria-label="Remove line">×</button></td>
+</tr>
