@@ -1,0 +1,122 @@
+{% extends "Chokies/manager/base.html" %}
+
+{% block title %}{{ take.number }}{% endblock %}
+
+{% block content %}
+
+    {# ---------------- Page head ---------------- #}
+    <div class="head">
+        <div>
+            <h1>{{ take.number }} <span class="pill {{ take.status }}">{{ take.get_status_display }}</span></h1>
+            <p>{{ take.location.name }}, {% if take.is_opening %}opening stock{% else %}regular count{% endif %}{% if take.blind and draft %}, blind (expected quantities hidden){% endif %}. Started {{ take.created_at|date:"j M Y H:i" }} by {{ take.created_by.username }}.</p>
+        </div>
+        <div class="acts">
+            <button class="btn" onclick="window.print()">Print count sheet</button>
+            <a class="btn" href="{% url 'manager:stock_takes' %}">All stock takes</a>
+        </div>
+    </div>
+
+    {# ---------------- Summary ---------------- #}
+    <div class="card kv">
+        <div><small>Counted</small><b>{{ counted }} of {{ lines|length }}</b></div>
+        <div><small>Not counted yet</small><b>{{ uncounted }}</b></div>
+        <div><small>Lines with a variance</small><b>{{ varied|length }}</b></div>
+        <div><small>{% if take.is_opening %}Opening value{% else %}Net variance value{% endif %}</small><b>{{ net_value|floatformat:2 }}</b></div>
+    </div>
+
+    {# ---------------- Count sheet ---------------- #}
+    <form method="post">
+        {% csrf_token %}
+
+        <div class="card">
+            <div class="tw">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Item</th>
+                            <th>Category</th>
+                            <th>Unit</th>
+                            <th class="n">Item quantity</th>
+                            {% if take.is_opening %}<th class="n">Cost per unit</th>{% endif %}
+                            <th class="n">Stock value</th>
+                            <th class="noprint">Action</th>
+                        </tr>
+                    </thead>
+
+                    <tbody>
+                        {% for l in lines %}
+                            <tr data-take-line data-avg="{{ l.item.avg_cost|stringformat:'f' }}">
+
+                                {# Item name #}
+                                <td>{{ l.item.name }}</td>
+
+                                {# Category #}
+                                <td>{{ l.item.category|default:"-" }}</td>
+
+                                {# Unit #}
+                                <td>{{ l.item.stock_unit }}</td>
+
+                                {# Item quantity: the count (typed while counting), with the book quantity and variance underneath #}
+                                <td class="n">
+                                    {% if draft %}
+                                        <input class="tk-count" name="count_{{ l.pk }}" size="9" inputmode="decimal" value="{{ l.counted|floatformat:'-4'|default_if_none:'' }}" aria-label="Count for {{ l.item.name }}">
+                                    {% else %}
+                                        {{ l.counted|floatformat:"-2"|default:"-" }}
+                                    {% endif %}
+
+                                    {% if show_expected or l.counted != None %}
+                                        <br>
+                                        {% if show_expected %}<small>Expected {{ l.expected|floatformat:"-2" }}</small>{% endif %}
+                                        {% if l.counted != None %}
+                                            {% if l.variance > 0 %}
+                                                <span class="pill ok">+{{ l.variance|floatformat:"-2" }}</span>
+                                            {% elif l.variance < 0 %}
+                                                <span class="pill bad">{{ l.variance|floatformat:"-2" }}</span>
+                                            {% else %}
+                                                <small>no variance</small>
+                                            {% endif %}
+                                        {% endif %}
+                                    {% endif %}
+                                </td>
+
+                                {# Cost per unit: opening counts only, because that count sets the cost #}
+                                {% if take.is_opening %}
+                                    <td class="n">
+                                        {% if draft %}
+                                            <input class="tk-cost" name="cost_{{ l.pk }}" size="9" inputmode="decimal" value="{{ l.unit_cost|floatformat:'-4' }}" placeholder="{{ l.item.avg_cost|floatformat:'-2' }}" aria-label="Cost for {{ l.item.name }}">
+                                        {% else %}
+                                            {{ l.unit_cost|floatformat:2 }}
+                                        {% endif %}
+                                    </td>
+                                {% endif %}
+
+                                {# Stock value: counted quantity x cost per unit #}
+                                <td class="n"><span class="tk-value">{% if l.value != None %}{{ l.value|floatformat:2 }}{% else %}-{% endif %}</span></td>
+
+                                {# Action: clear the count while counting, open the item afterwards #}
+                                <td class="noprint">
+                                    {% if draft %}
+                                        <button type="button" class="btn sm ghost tk-clear" aria-label="Clear count for {{ l.item.name }}">Clear</button>
+                                    {% else %}
+                                        <a class="btn sm" href="{% url 'manager:item_detail' l.item.pk %}">View item</a>
+                                    {% endif %}
+                                </td>
+
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        {# ---------------- Save / approve ---------------- #}
+        {% if draft %}
+            <div class="acts noprint">
+                <button class="btn" name="action" value="save">Save counts</button>
+                <button class="btn primary" name="action" value="approve" onclick="return confirm('Approve {{ take.number }}? Variances are written to the stock ledger and cannot be edited afterwards. {{ uncounted }} item(s) not counted will be left unchanged.')">Save and approve</button>
+            </div>
+            <p class="help noprint">Saving shows each variance against the expected quantity. Items left blank are not adjusted. Clear empties a row's count; save to apply it.</p>
+        {% endif %}
+    </form>
+
+{% endblock %}

@@ -1,0 +1,21 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Discounts{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Discounts</h1><p>Discount an unpaid bill, or only some of its items. A new discount replaces the old one; the bill and VAT are recalculated.</p></div></div>
+<form class="filters" method="get"><label>Find a bill<input name="q" value="{{ f.q }}" placeholder="Bill, order or table"></label><button class="btn">Search</button><a class="btn" href="{% url 'manager:discounts' %}">Clear</a></form>
+<div class="card"><h2>Unpaid bills</h2>
+{% for b in bills %}<div class="rowline">
+ <span class="grow"><b>{{ b.number }}</b> for {{ b.order.number }} <span class="muted">{% if b.order.table %}{{ b.order.table.name }}, {% endif %}waiter {{ b.order.waiter.get_full_name|default:b.order.waiter.username }}</span></span>
+ <span>Total <b>{{ b.total|floatformat:2 }}</b>{% if b.discount_amount %} <span class="pill ok">Discount {{ b.discount_amount|floatformat:2 }}</span>{% endif %}</span>
+ <details class="act"><summary class="btn sm primary">{% if b.discount_amount %}Change discount{% else %}Give a discount{% endif %}</summary>
+ <form method="post" action="{% url 'manager:discount_action' b.pk 'apply' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}">
+  <div class="filters"><label>Type<select name="kind"><option value="percent">Percentage</option><option value="amount">Amount</option></select></label><label>Value<input name="value" inputmode="decimal" required size="8"></label>
+   <label>Reason<input name="reason" required placeholder="e.g. Birthday, service recovery"></label></div>
+  <label class="chk"><input type="radio" name="scope" value="bill" checked> Whole bill</label>
+  <label class="chk"><input type="radio" name="scope" value="lines"> Only these items:</label>
+  <div class="indent">{% for l in b.lines %}<label class="chk"><input type="checkbox" name="line" value="{{ forloop.counter0 }}"> {{ l.quantity }} x {{ l.name }} <span class="muted">{{ l.line_total }}</span></label>{% endfor %}</div>
+  <div><button class="btn sm primary">Apply discount</button></div></form></details>
+ {% if b.discount_amount %}<details class="act"><summary class="btn sm danger">Remove discount</summary><form method="post" action="{% url 'manager:discount_action' b.pk 'remove' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}"><input name="reason" placeholder="Reason (required)" required><button class="btn sm danger">Remove from {{ b.number }}</button></form></details>{% endif %}</div>
+{% empty %}<p class="empty">No unpaid bills right now.</p>{% endfor %}</div>
+<div class="card"><h2>Recent discounts</h2><div class="tw"><table><thead><tr><th>When</th><th>Bill</th><th class="n">Discount</th><th>Applies to</th><th>Reason</th><th class="n">Bill total</th><th>Approved by</th></tr></thead><tbody>
+{% for l in logs %}<tr><td>{{ l.created_at|date:"j M H:i" }}</td><td>{{ l.what|default:"-" }}</td><td class="n">{% if l.action == "discount_removed" %}<span class="pill warn">Removed</span> {% endif %}{{ l.details.amount }}</td><td class="wrap">{{ l.details.scope|default:"-" }}</td><td class="wrap">{{ l.details.reason }}</td><td class="n">{% if l.details.total_after %}{{ l.details.total_before }} to {{ l.details.total_after }}{% else %}-{% endif %}</td><td>{{ l.user.username|default:"-" }}</td></tr>
+{% empty %}<tr><td colspan="7" class="empty">No discounts given yet.</td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}

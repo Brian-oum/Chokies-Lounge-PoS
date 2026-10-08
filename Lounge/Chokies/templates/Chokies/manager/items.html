@@ -1,0 +1,21 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Items{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Items</h1><p>Ingredients and drinks you stock, with what is on hand across every location.</p></div>
+<div class="acts"><a class="btn primary" href="{% url 'manager:item_new' %}">New item</a></div></div>
+<form class="filters" method="get">
+  <label>Search<input name="q" value="{{ f.q }}" placeholder="Name or SKU"></label>
+  <label>Category<select name="category"><option value="">All</option>{% for c in categories %}<option{% if f.category == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
+  <label class="chk"><input type="checkbox" name="low" value="1"{% if f.low %} checked{% endif %}> Low stock only</label>
+  <label class="chk"><input type="checkbox" name="show" value="all"{% if f.show == "all" %} checked{% endif %}> Include inactive</label>
+  <button class="btn">Filter</button><a class="btn" href="{% url 'manager:items' %}">Clear</a>
+</form>
+<div class="card"><div class="tw"><table>
+<thead><tr><th>SKU</th><th>Item</th><th>Category</th><th class="n">On hand</th><th class="n">Reorder at</th><th class="n">Avg cost</th><th class="n">Value</th><th>Actions</th></tr></thead><tbody>
+{% for i in page %}<tr class="{% if i.low %}low{% endif %}">
+ <td>{{ i.sku }}</td><td><a href="{% url 'manager:item_detail' i.pk %}">{{ i.name }}</a>{% if not i.is_active %} <span class="pill CANCELLED">Inactive</span>{% endif %}{% if i.low %} <span class="pill warn">Low</span>{% endif %}</td>
+ <td>{{ i.category|default:"-" }}</td><td class="n">{{ i.on_hand_total|floatformat:"-2" }} {{ i.stock_unit }}</td><td class="n">{{ i.reorder_level|floatformat:"-2" }}</td>
+ <td class="n">{{ i.avg_cost|floatformat:2 }}</td><td class="n">{{ i.value|floatformat:2 }}</td>
+ <td><div class="row-acts"><a class="btn sm" href="{% url 'manager:item_edit' i.pk %}">Edit</a><a class="btn sm" href="{% url 'manager:issue' %}">Issue</a>
+  <form method="post" action="{% url 'manager:item_toggle' i.pk %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}"><button class="btn sm">{% if i.is_active %}Deactivate{% else %}Activate{% endif %}</button></form></div></td></tr>
+{% empty %}<tr><td colspan="8" class="empty">No items match.</td></tr>{% endfor %}</tbody></table></div>
+{% include "Chokies/manager/_pager.html" %}</div>{% endblock %}

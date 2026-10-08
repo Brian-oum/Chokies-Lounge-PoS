@@ -1,0 +1,21 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Purchases{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Purchases</h1><p>Every delivery received, whether bought directly or against an LPO.</p></div>
+<div class="acts"><a class="btn primary" href="{% url 'manager:purchase_new' %}">New purchase</a></div></div>
+<form class="filters" method="get">
+  <label>Search<input name="q" value="{{ f.q }}" placeholder="Number, invoice, supplier"></label>
+  <label>Supplier<select name="supplier"><option value="">All</option>{% for s in suppliers %}<option value="{{ s.pk }}"{% if f.supplier == s.pk|stringformat:"s" %} selected{% endif %}>{{ s.name }}</option>{% endfor %}</select></label>
+  <label>Type<select name="kind"><option value="">All</option><option value="direct"{% if f.kind == "direct" %} selected{% endif %}>Direct purchases</option><option value="lpo"{% if f.kind == "lpo" %} selected{% endif %}>Against an LPO</option></select></label>
+  <label>From<input type="date" name="from" value="{{ f.from }}"></label><label>To<input type="date" name="to" value="{{ f.to }}"></label>
+  <button class="btn">Filter</button><a class="btn" href="{% url 'manager:purchases' %}">Clear</a>
+</form>
+<div class="card"><div class="tw"><table>
+<thead><tr><th>Receipt</th><th>Date</th><th>Supplier</th><th>Type</th><th>Invoice</th><th>Received into</th><th>By</th><th class="n">Value</th></tr></thead>
+<tbody>{% for r in page %}<tr>
+ <td><a href="{% url 'manager:purchase_detail' r.pk %}">{{ r.number }}</a></td><td>{{ r.created_at|date:"j M Y H:i" }}</td><td>{{ r.po.supplier.name }}</td>
+ <td>{% if r.direct %}<span class="pill ok">Direct</span>{% else %}<a href="{% url 'manager:lpo_detail' r.po.pk %}">{{ r.po.number }}</a>{% endif %}</td>
+ <td>{{ r.invoice_no|default:"-" }}</td><td>{{ r.location.name }}</td><td>{{ r.received_by.get_full_name|default:r.received_by.username }}</td><td class="n">{{ r.value|floatformat:2 }}</td></tr>
+{% empty %}<tr><td colspan="8" class="empty">No purchases match. <a href="{% url 'manager:purchase_new' %}">Record one</a>.</td></tr>{% endfor %}</tbody>
+<tfoot><tr><td colspan="7">Total of everything listed (all pages)</td><td class="n">{{ total|floatformat:2 }}</td></tr></tfoot></table></div>
+{% include "Chokies/manager/_pager.html" %}</div>
+{% endblock %}

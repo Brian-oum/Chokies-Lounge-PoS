@@ -1,0 +1,10 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}{{ r.number }}{% endblock %}
+{% block content %}
+<div class="head"><div><h1>{{ r.number }}</h1><p>{% if direct %}Direct purchase {{ r.po.number }}{% else %}Delivery against <a href="{% url 'manager:lpo_detail' r.po.pk %}">{{ r.po.number }}</a>{% endif %} from {{ r.po.supplier.name }}</p></div>
+<div class="acts"><button class="btn" onclick="window.print()">Print</button><a class="btn" href="{% url 'manager:purchases' %}">Back to purchases</a></div></div>
+<div class="card kv"><div><small>Received</small><b>{{ r.created_at|date:"j M Y H:i" }}</b></div><div><small>Into</small><b>{{ r.location.name }}</b></div>
+<div><small>Supplier invoice</small><b>{{ r.invoice_no|default:"-" }}</b></div><div><small>Received by</small><b>{{ r.received_by.get_full_name|default:r.received_by.username }}</b></div></div>
+<div class="card"><div class="tw"><table><thead><tr><th>Item</th><th class="n">Quantity</th><th class="n">Cost each</th><th class="n">Value</th><th class="n">Added to stock</th></tr></thead><tbody>
+{% for l in lines %}<tr><td><a href="{% url 'manager:item_detail' l.item.pk %}">{{ l.item.name }}</a></td><td class="n">{{ l.qty|floatformat:"-2" }} {{ l.unit }}</td><td class="n">{{ l.cost|floatformat:2 }}</td><td class="n">{{ l.value|floatformat:2 }}</td><td class="n">{{ l.stock_qty|floatformat:"-2" }} {{ l.item.stock_unit }}</td></tr>{% endfor %}
+</tbody><tfoot><tr><td colspan="3">Total</td><td class="n">{{ total|floatformat:2 }}</td><td></td></tr></tfoot></table></div></div>
+{% endblock %}

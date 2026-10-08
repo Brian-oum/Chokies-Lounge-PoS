@@ -1,0 +1,15 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}New purchase{% endblock %}
+{% block content %}
+<div class="head"><div><h1>New purchase</h1><p>Goods bought and received now, with no LPO. Stock and average cost update when you save.</p></div></div>
+<form method="post" class="form">{% csrf_token %}
+<div class="card"><h2>Supplier and delivery</h2><div class="grid2">
+  <label>Supplier<select name="supplier"><option value="">Choose a supplier</option>{% for s in suppliers %}<option value="{{ s.pk }}"{% if post.supplier == s.pk|stringformat:"s" %} selected{% endif %}>{{ s.name }}</option>{% endfor %}</select></label>
+  <label>Or a new supplier<input name="new_supplier" value="{{ post.new_supplier }}" placeholder="Name"></label>
+  <label>New supplier phone<input name="new_supplier_phone" value="{{ post.new_supplier_phone }}"></label>
+  <label>Receive into<select name="location">{% for l in locations %}<option value="{{ l.pk }}"{% if l == sel_location %} selected{% endif %}>{{ l.name }}</option>{% endfor %}</select></label>
+  <label>Supplier invoice / receipt no.<input name="invoice_no" value="{{ post.invoice_no }}"></label>
+  <label>Notes<input name="notes" value="{{ post.notes }}"></label></div></div>
+<div class="card"><h2>Items bought</h2>{% include "Chokies/manager/_lines.html" with cost=True %}</div>
+<div class="acts"><button class="btn primary">Save and receive</button><a class="btn" href="{% url 'manager:purchases' %}">Cancel</a></div>
+</form>{% endblock %}
+{% block scripts %}{% load static %}<script src="{% static 'js/manager.js' %}"></script>{% endblock %}

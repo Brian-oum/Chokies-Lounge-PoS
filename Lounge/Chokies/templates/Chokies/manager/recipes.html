@@ -1,0 +1,46 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Recipes{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Recipes</h1><p>What one portion of each menu item takes out of stock. When it is sold, these amounts are deducted from the Kitchen or Bar.</p></div></div>
+
+<div class="rc-stats">
+ <div class="rc-stat"><small>Menu items</small><b>{{ stats.total }}</b></div>
+ <div class="rc-stat ok"><small>With a recipe</small><b>{{ stats.with }}</b></div>
+ <div class="rc-stat {% if stats.empty %}bad{% endif %}"><small>Tracked, no recipe</small><b>{{ stats.empty }}</b></div>
+ <div class="rc-stat {% if stats.low %}warn{% endif %}"><small>Margin under {{ target|floatformat:"-1" }}% (this list)</small><b>{{ stats.low }}</b></div>
+</div>
+
+<form method="get" class="card rc-filters">
+ <label>Search<input type="search" name="q" value="{{ f.q }}" placeholder="Dish or category"></label>
+ <label>Category<select name="category"><option value="">All</option>{% for c in categories %}<option value="{{ c.pk }}"{% if f.category == c.pk|stringformat:"s" %} selected{% endif %}>{{ c.name }}</option>{% endfor %}</select></label>
+ <label>Station<select name="station"><option value="">All</option>{% for v, n in stations %}<option value="{{ v }}"{% if f.station == v %} selected{% endif %}>{{ n }}</option>{% endfor %}</select></label>
+ <label>Sort<select name="sort"><option value="">Menu order</option><option value="margin"{% if f.sort == "margin" %} selected{% endif %}>Lowest margin first</option><option value="cost"{% if f.sort == "cost" %} selected{% endif %}>Highest cost first</option></select></label>
+ <label class="chk"><input type="checkbox" name="missing" value="1"{% if f.missing %} checked{% endif %}>Only tracked items with no recipe</label>
+ <button class="btn primary">Filter</button>
+</form>
+
+<div class="card"><div class="tw"><table class="rc-table">
+ <thead><tr><th>Menu item</th><th class="rc-hide-sm">Station</th><th class="num">Price</th><th class="num rc-hide-sm">Ingredients</th><th class="num">Cost / portion</th><th class="num">Margin</th><th>Status</th><th></th></tr></thead>
+ <tbody>
+ {% for r in page %}<tr>
+  <td><a class="dish" href="{% url 'manager:recipe_edit' r.dish.pk %}">{{ r.dish.name }}</a><small>{{ r.dish.category.name }}</small></td>
+  <td class="rc-hide-sm">{{ r.dish.get_station_display }}</td>
+  <td class="num">{{ r.dish.price|floatformat:2 }}</td>
+  <td class="num rc-hide-sm">{{ r.n|default:"-" }}</td>
+  <td class="num">{% if r.cost is not None %}{{ r.cost|floatformat:2 }}{% else %}-{% endif %}</td>
+  <td class="num{% if r.low %} bad{% endif %}">{% if r.margin is not None %}{{ r.margin }}%{% else %}-{% endif %}</td>
+  <td>{% if r.tracked_empty %}<span class="rc-pill bad">Tracked, no recipe</span>
+      {% elif r.untracked_recipe %}<span class="rc-pill warn">Tracking off</span>
+      {% elif r.n %}<span class="rc-pill ok">Deducting stock</span>
+      {% else %}<span class="rc-pill off">Not tracked</span>{% endif %}</td>
+  <td class="num"><a class="btn sm" href="{% url 'manager:recipe_edit' r.dish.pk %}">{% if r.n %}Edit{% else %}Add recipe{% endif %}</a></td>
+ </tr>
+ {% empty %}<tr><td colspan="8" class="empty">No menu items match.</td></tr>{% endfor %}
+ </tbody></table></div>
+ {% if page.has_other_pages %}<div class="rc-pager">
+  {% if page.has_previous %}<a class="btn sm" href="?{{ qs }}&page={{ page.previous_page_number }}">Previous</a>{% endif %}
+  <span class="muted">Page {{ page.number }} of {{ page.paginator.num_pages }}</span>
+  {% if page.has_next %}<a class="btn sm" href="?{{ qs }}&page={{ page.next_page_number }}">Next</a>{% endif %}
+ </div>{% endif %}
+</div>
+<p class="muted">Cost uses each ingredient's average cost per stock unit, so it moves as purchase prices change. Margin is measured on the selling price{% if includes_tax %} without tax{% endif %}.</p>
+{% endblock %}

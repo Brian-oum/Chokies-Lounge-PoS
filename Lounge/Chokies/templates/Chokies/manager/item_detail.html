@@ -1,0 +1,12 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}{{ item.name }}{% endblock %}
+{% block content %}
+<div class="head"><div><h1>{{ item.name }} {% if not item.is_active %}<span class="pill CANCELLED">Inactive</span>{% endif %}{% if low %} <span class="pill warn">Low stock</span>{% endif %}</h1><p>{{ item.sku }}{% if item.category %}, {{ item.category }}{% endif %}</p></div>
+<div class="acts"><a class="btn" href="{% url 'manager:item_edit' item.pk %}">Edit</a><a class="btn" href="{% url 'manager:issue' %}">Issue stock</a><a class="btn" href="{% url 'manager:items' %}">Back to items</a></div></div>
+<div class="card kv"><div><small>On hand</small><b>{{ total|floatformat:"-2" }} {{ item.stock_unit }}</b></div><div><small>Average cost</small><b>{{ item.avg_cost|floatformat:2 }} per {{ item.stock_unit }}</b></div>
+<div><small>Stock value</small><b>{{ value|floatformat:2 }}</b></div><div><small>Reorder / par</small><b>{{ item.reorder_level|floatformat:"-2" }} / {{ item.par_level|floatformat:"-2" }}</b></div>
+<div><small>Buy in</small><b>{{ item.purchase_unit }} = {{ item.stock_units_per_purchase_unit|floatformat:"-2" }} {{ item.stock_unit }}</b></div></div>
+<div class="grid2"><div class="card"><h2>By location</h2><table><tbody>{% for x in per_loc %}<tr><td>{{ x.loc.name }}</td><td class="n">{{ x.qty|floatformat:"-2" }} {{ item.stock_unit }}</td></tr>{% endfor %}</tbody></table></div>
+<div class="card"><h2>Used in recipes</h2>{% for r in recipes %}<div class="rowline"><span class="grow">{{ r.menu_item.name }}</span><b>{{ r.quantity|floatformat:"-2" }} {{ item.recipe_unit }}</b></div>{% empty %}<p class="muted">Not used in any recipe.</p>{% endfor %}</div></div>
+<div class="card"><h2>Recent movements</h2><div class="tw"><table><thead><tr><th>When</th><th>Type</th><th>Location</th><th class="n">Quantity</th><th>Reference</th><th>By</th><th>Reason</th></tr></thead><tbody>
+{% for m in moves %}<tr><td>{{ m.created_at|date:"j M H:i" }}</td><td>{{ m.get_movement_type_display }}</td><td>{{ m.location.name }}</td><td class="n">{{ m.quantity|floatformat:"-2" }}</td><td>{{ m.ref_id|default:"-" }}</td><td>{{ m.user.username|default:"-" }}</td><td class="wrap">{{ m.reason }}</td></tr>
+{% empty %}<tr><td colspan="7" class="empty">No movements yet.</td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}

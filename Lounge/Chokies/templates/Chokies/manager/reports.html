@@ -1,0 +1,27 @@
+{% extends "Chokies/manager/base.html" %}
+{% block content %}
+<div class="head">
+  <div>
+    <h1>Reports</h1>
+    <p>Sales, staff, stock and control reports for managers. Pick a report, choose the dates, and print it or download it as CSV.</p>
+  </div>
+</div>
+
+<div class="rc-stats">
+  {% for t in tiles %}<div class="rc-stat {{ t.cls }}"><span>{{ t.label }}</span><b>{{ t.value }}</b></div>{% endfor %}
+</div>
+
+{% for group, reports in groups %}
+<div class="card">
+  <h2>{{ group }}</h2>
+  {% for r in reports %}
+  <div class="rowline">
+    <a class="strong" href="{% url 'manager:report' r.slug %}">{{ r.title }}</a>
+    <span class="grow"></span>
+    <a class="btn sm outline" href="{% url 'manager:report' r.slug %}">Open</a>
+    <span class="sub">{{ r.blurb }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endfor %}
+{% endblock %}

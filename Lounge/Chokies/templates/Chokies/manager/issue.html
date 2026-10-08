@@ -1,0 +1,21 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Issue stock{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Issue stock</h1><p>Move stock from the store to the kitchen or bar, or write off breakage and spoilage. Quantities are in stock units.</p></div></div>
+<form method="post" class="form">{% csrf_token %}
+<div class="card"><div class="seg" role="radiogroup" aria-label="What are you doing?"><label><input type="radio" name="mode" value="issue"{% if mode != "writeoff" %} checked{% endif %}>Issue to a location</label><label><input type="radio" name="mode" value="writeoff"{% if mode == "writeoff" %} checked{% endif %}>Write off</label></div>
+<div class="grid2" style="margin-top:.9rem">
+ <label>From<select name="from_location">{% for l in locations %}<option value="{{ l.pk }}"{% if l == sel_from %} selected{% endif %}>{{ l.name }}</option>{% endfor %}</select></label>
+ <label id="to-wrap">To<select name="to_location"><option value="">Choose a location</option>{% for l in locations %}<option value="{{ l.pk }}"{% if post.to_location == l.pk|stringformat:"s" %} selected{% endif %}>{{ l.name }}</option>{% endfor %}</select></label>
+ <label><span id="why-label">Note (optional)</span><input name="reason" value="{{ post.reason }}"></label></div></div>
+<div class="card"><h2>Items</h2>{% include "Chokies/manager/_lines.html" with unit="stock" %}</div>
+<div class="acts"><button class="btn primary">Save</button></div></form>
+<div class="card"><h2>Recent issues and write-offs</h2>
+{% for h in history %}<div class="rowline"><span class="grow"><b>{{ h.ref }}</b> <span class="muted">{{ h.at|date:"j M H:i" }} by {{ h.user.username|default:"-" }}</span>
+ {% if h.dest %}<span class="pill ok">{{ h.src.name }} to {{ h.dest.name }}</span>{% else %}<span class="pill bad">Written off from {{ h.src.name }}</span>{% endif %}
+ <span class="muted">{% if h.reason %}{{ h.reason }}{% endif %}</span></span><span>Value <b>{{ h.value|floatformat:2 }}</b></span>
+ <div class="sub">{% for m in h.lines %}{{ m.item.name }} {{ m.quantity|floatformat:"-2" }}{% if not forloop.last %}; {% endif %}{% endfor %}</div></div>
+{% empty %}<p class="empty">Nothing issued yet.</p>{% endfor %}</div>{% endblock %}
+{% block scripts %}{% load static %}<script src="{% static 'js/manager.js' %}"></script>
+<script>(function(){const r=[...document.querySelectorAll('[name=mode]')],to=document.getElementById('to-wrap'),why=document.getElementById('why-label'),reason=document.querySelector('[name=reason]');
+function sync(){const w=r.find(x=>x.checked).value==='writeoff';to.hidden=w;why.textContent=w?'Reason (required)':'Note (optional)';reason.required=w;}
+r.forEach(x=>x.addEventListener('change',sync));sync();})();</script>{% endblock %}

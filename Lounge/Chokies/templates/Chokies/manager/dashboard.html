@@ -1,0 +1,18 @@
+{% extends "Chokies/manager/base.html" %}{% block title %}Overview{% endblock %}
+{% block content %}
+<div class="head"><div><h1>Overview</h1><p>What needs a manager today.</p></div></div>
+<div class="tiles">
+  <a class="tile {% if low_count %}alert{% endif %}" href="{% url 'manager:balances' %}?low=1"><b>{{ low_count }}</b>items at or below reorder level</a>
+  <a class="tile" href="{% url 'manager:lpos' %}?status=DRAFT"><b>{{ draft_lpos }}</b>draft LPOs to send</a>
+  <a class="tile" href="{% url 'manager:receive' %}"><b>{{ awaiting }}</b>LPOs awaiting delivery</a>
+  <a class="tile" href="{% url 'manager:stock_takes' %}"><b>{{ takes_open }}</b>stock takes in progress</a>
+  <a class="tile" href="{% url 'manager:discounts' %}"><b>{{ open_bills }}</b>unpaid bills open to discount</a>
+  <a class="tile" href="{% url 'manager:voids' %}"><b>{{ voids_today }}</b>items voided today</a>
+  <a class="tile" href="{% url 'manager:discounts' %}"><b>{{ discounts_today }}</b>discounts given today</a>
+  <a class="tile" href="{% url 'manager:purchases' %}"><b>{{ spent_month|floatformat:2 }}</b>bought since {{ month|date:"j M" }}</a>
+</div>
+<div class="card"><h2>Running low</h2>
+{% if low_items %}<div class="tw"><table><thead><tr><th>Item</th><th class="n">On hand</th><th class="n">Reorder level</th><th></th></tr></thead><tbody>
+{% for i in low_items %}<tr><td><a href="{% url 'manager:item_detail' i.pk %}">{{ i.name }}</a></td><td class="n">{{ i.on_hand_total|floatformat:"-2" }} {{ i.stock_unit }}</td><td class="n">{{ i.reorder_level|floatformat:"-2" }}</td><td class="n"><a href="{% url 'manager:lpo_new' %}">Order</a></td></tr>{% endfor %}
+</tbody></table></div>{% else %}<p class="empty">Everything is above its reorder level.</p>{% endif %}</div>
+{% endblock %}

@@ -1,0 +1,8 @@
+{# Item lines. Needs: items, rows. Optional: cost (show a cost column), unit ("stock" counts stock units), balances (issue page). #}
+<div class="tw"><table class="lines" data-unit="{{ unit|default:'purchase' }}">
+  <thead><tr><th>Item</th><th>Quantity</th>{% if cost %}<th>Cost per purchase unit</th>{% endif %}<th></th></tr></thead>
+  <tbody>{% for r in rows %}{% include "Chokies/manager/_row.html" %}{% endfor %}</tbody>
+</table></div>
+<template id="line-tpl">{% include "Chokies/manager/_row.html" with r=None %}</template>
+<p><button type="button" id="add-line" class="btn sm">Add a line</button></p>
+{{ items|json_script:"item-data" }}{% if balances %}{{ balances|json_script:"bal-data" }}{% endif %}

@@ -1,0 +1,56 @@
+{% extends "Chokies/manager/base.html" %}
+{% block content %}
+<div class="head">
+  <div>
+    <h1>{{ report.title }}</h1>
+    <p>{{ report.blurb }} <strong>{{ start|date:"j M Y" }}{% if start != end %} to {{ end|date:"j M Y" }}{% endif %}</strong></p>
+  </div>
+  <div class="acts noprint">
+    <a class="btn" href="?{{ qs }}{% if qs %}&{% endif %}export=csv">Download CSV</a>
+    <button type="button" class="btn" onclick="window.print()">Print</button>
+    <a class="btn ghost" href="{% url 'manager:reports' %}">All reports</a>
+  </div>
+</div>
+
+<form class="filters" method="get">
+  <span class="pc-cap small">
+    {% for label, f, t in presets %}<a class="btn sm ghost" href="?from={{ f|date:'Y-m-d' }}&to={{ t|date:'Y-m-d' }}">{{ label }}</a> {% endfor %}
+  </span>
+  <label>From <input type="date" name="from" value="{{ start|date:'Y-m-d' }}"></label>
+  <label>To <input type="date" name="to" value="{{ end|date:'Y-m-d' }}"></label>
+  {% for s in selects %}
+  <label>{{ s.label }}
+    <select name="{{ s.name }}">
+      {% for value, text in s.options %}<option value="{{ value }}"{% if value == s.value %} selected{% endif %}>{{ text }}</option>{% endfor %}
+    </select>
+  </label>
+  {% endfor %}
+  <button class="btn">Show report</button>
+</form>
+
+{% if tiles %}
+<div class="rc-stats">
+  {% for t in tiles %}<div class="rc-stat {{ t.cls }}"><span>{{ t.label }}</span><b>{{ t.value }}</b></div>{% endfor %}
+</div>
+{% endif %}
+
+{% for s in sections %}
+<div class="card">
+  <h2>{{ s.title }}</h2>
+  {% if s.note %}<p class="help">{{ s.note }}</p>{% endif %}
+  {% if s.rows %}
+  <div class="tw">
+    <table>
+      <thead><tr>{% for c in s.cols %}<th{% if c.c %} class="{{ c.c }}"{% endif %}>{{ c.label }}</th>{% endfor %}</tr></thead>
+      <tbody>
+        {% for row in s.rows %}<tr>{% for cell in row %}<td{% if cell.c %} class="{{ cell.c }}"{% endif %}>{{ cell.t }}</td>{% endfor %}</tr>{% endfor %}
+      </tbody>
+      {% if s.foot %}<tfoot><tr>{% for cell in s.foot %}<td{% if cell.c %} class="{{ cell.c }}"{% endif %}>{{ cell.t }}</td>{% endfor %}</tr></tfoot>{% endif %}
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">Nothing to show for these dates.</div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}
