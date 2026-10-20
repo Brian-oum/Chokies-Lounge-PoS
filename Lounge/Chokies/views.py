@@ -16,6 +16,7 @@ Sections: helpers - auth - shifts - catalog - orders - billing - end of day -
 import base64
 import hmac
 import json
+import logging
 import math
 import re
 import urllib.error
@@ -34,10 +35,12 @@ from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
 from django.db.models import Count, Q, Sum
 from html import escape as esc
+from urllib.parse import urlencode, urlsplit
 
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template import TemplateDoesNotExist
+from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
@@ -54,13 +57,15 @@ from .models import (KOT, AuditLog, AuthFailed, Bill, CashMovement, DocumentSequ
                      ManagerApprovalRequired, MenuItem, Modifier, MovementType, NotOnShift, Order, OrderConflict,
                      OrderItem, Payment, PinLocked, PurchaseOrder, PurchaseOrderLine, Shift, ShiftAssignment,
                      Station, StockBalance, StockItem, StockMovement, StockTake, StockTakeLine, Table, User,
-                     ZReport, Category, audit)
+                     ZReport, Category, MealPlan, RoomUnavailable, Room, RoomBooking, RoomBookingLine, audit)
 
 D = Decimal
 TWO = D("0.01")
 Role = ShiftAssignment.Role
 
-
+POS_LOGIN_TEMPLATE = getattr(settings, "POS_LOGIN_TEMPLATE", "Chokies/login.html")
+log = logging.getLogger(__name__)
+POS_HOME_URL = getattr(settings, "POS_HOME_URL", "/")
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -144,16 +149,20 @@ def _require_cashier(user, what="Printing receipts"):
     raise ManagerApprovalRequired(f"{what} is done by the cashier. Please send the guest to the cashier.")
 
 
-def _check_bill_access(user, drawer, order):
-    """Waiters bill and collect only on their own orders; cashiers and managers on any order."""
-    if drawer.role == Role.WAITER and not user.is_manager and order.waiter_id != user.pk:
-        raise ManagerApprovalRequired(f"Order {order.number} belongs to another waiter")
+def _check_bill_access(user, drawer, doc):
+    """Waiters bill and collect only on their own orders / bookings; cashiers and managers on any.
+    `doc` is the Order or RoomBooking the bill is for."""
+    owner = doc.waiter_id if isinstance(doc, Order) else doc.booked_by_id
+    if drawer.role == Role.WAITER and not user.is_manager and owner != user.pk:
+        kind = "Order" if isinstance(doc, Order) else "Booking"
+        raise ManagerApprovalRequired(f"{kind} {doc.number} belongs to another waiter")
 
 
 def user_payload(user, assignment=None):
     assignment = assignment or active_assignment(user)
     return {"id": user.pk, "username": user.username, "name": user.get_full_name() or user.username,
             "role": user.role, "is_manager": user.is_manager, "prices_include_tax": settings.PRICES_INCLUDE_TAX,
+            "room_vat_percent": float(_room_vat()), "room_levy_percent": float(_room_levy()),
             "shift": None if assignment is None else {
                 "id": assignment.shift_id, "name": assignment.shift.name, "role": assignment.role,
                 "terminal": assignment.terminal}}
@@ -188,6 +197,83 @@ def authenticate_pin(*, username, pin):
     if user.needs_shift and assignment is None:
         raise NotOnShift("You are not on an open shift. Ask a manager to add you to one.")
     return {"token": issue_token(user), "user": user_payload(user, assignment)}
+
+
+# --- PIN-only sign-in (the login page): the PIN alone says who you are ---------------------------------------
+# With no username, wrong guesses cannot be counted against a person, so they are counted against the device /
+# network address instead. Successful sign-ins do not reset the count (otherwise a valid PIN could be used to keep
+# guessing). Needs a cache shared by all workers to be exact: the default per-process cache is fine for one worker.
+PIN_LOGIN_MAX_FAILS = getattr(settings, "POS_PIN_LOGIN_MAX_FAILS", 10)           # wrong PINs allowed per window ...
+PIN_LOGIN_WINDOW_MIN = getattr(settings, "POS_PIN_LOGIN_WINDOW_MINUTES", 10)     # ... of this many minutes
+PIN_LOGIN_MAX_LEN = 12
+POS_PIN_LENGTH = getattr(settings, "POS_PIN_LENGTH", 0)     # e.g. 4: the login page signs in as soon as 4 digits are tapped; 0 = needs the Login button
+
+
+def client_id(request):
+    """Who is knocking: REMOTE_ADDR, or the first address of settings.POS_CLIENT_IP_HEADER (e.g. 'HTTP_X_FORWARDED_FOR')
+    when the app sits behind a proxy you control."""
+    header = getattr(settings, "POS_CLIENT_IP_HEADER", "")
+    raw = request.META.get(header, "") if header else ""
+    return (raw.split(",")[0].strip() or request.META.get("REMOTE_ADDR", "")) or "unknown"
+
+
+def _find_by_pin(pin):
+    """The active user who owns this PIN, or None. Uses the indexed fingerprint; people whose PIN predates it are found
+    by checking their hash once and then given a fingerprint, so this slow path disappears as staff sign in."""
+    fp = User.pin_fingerprint(pin)
+    user = User.objects.filter(pin_lookup=fp, is_active=True).first()
+    if user is not None:
+        return user
+    legacy_users = list(User.objects.filter(is_active=True, pin_lookup__isnull=True).exclude(pin_hash=""))
+    if legacy_users:       # every one of these costs ~0.5 s of hashing per attempt: this is what makes sign-in slow
+        log.warning("%d active user(s) still have an old-style PIN, so this sign-in had to check each of them (slow). "
+                    "Run 'python manage.py reset_pins --apply' once to make sign-in instant.", len(legacy_users))
+    legacy = [u for u in legacy_users if u.check_pin(pin)]
+    if len(legacy) > 1:
+        raise AuthFailed("More than one person has this PIN. Ask a manager to give you a new one.")
+    if legacy:
+        try:
+            with transaction.atomic():
+                User.objects.filter(pk=legacy[0].pk, pin_lookup__isnull=True).update(pin_lookup=fp)
+        except Exception:      # e.g. an inactive user already holds this fingerprint: sign in, fingerprint later
+            pass
+        return legacy[0]
+    return None
+
+
+def authenticate_by_pin(*, pin, request):
+    """Sign in with the PIN alone. Same rules as authenticate_pin afterwards: waiters / cashiers must be on an open
+    shift; a manager-locked account stays locked."""
+    cid = client_id(request)
+    fails_key, lock_key = f"poslogin:fails:{cid}", f"poslogin:lock:{cid}"
+    if cache.get(lock_key):
+        raise PinLocked(f"Too many wrong PINs from this device. Try again in {PIN_LOCK_MINUTES} minutes.")
+    pin = str(pin or "").strip()
+    user, refusal = None, AuthFailed("Wrong PIN. Try again.")
+    if pin.isdigit() and len(pin) <= PIN_LOGIN_MAX_LEN:
+        try:
+            user = _find_by_pin(pin)
+        except AuthFailed as e:          # a shared PIN is refused, and counted like any other failed guess
+            refusal = e
+    if user is None:
+        cache.add(fails_key, 0, PIN_LOGIN_WINDOW_MIN * 60)
+        try:
+            fails = cache.incr(fails_key)
+        except ValueError:      # the entry expired between add and incr
+            cache.set(fails_key, 1, PIN_LOGIN_WINDOW_MIN * 60); fails = 1
+        if fails >= PIN_LOGIN_MAX_FAILS:
+            cache.set(lock_key, 1, PIN_LOCK_MINUTES * 60); cache.delete(fails_key)
+            audit(None, "pin_login_locked", None, client=cid, minutes=PIN_LOCK_MINUTES)
+        raise refusal
+    if user.pin_is_locked:
+        raise PinLocked("This account is locked. Ask a manager to unlock it.")
+    assignment = active_assignment(user)
+    if user.needs_shift and assignment is None:
+        raise NotOnShift("You are not on an open shift. Ask a manager to add you to one.")
+    if user.failed_pin_attempts or user.pin_locked_until:      # only write when there is something to clear
+        user.failed_pin_attempts, user.pin_locked_until = 0, None
+        user.save(update_fields=["failed_pin_attempts", "pin_locked_until"])
+    return {"token": issue_token(user), "user": user_payload(user, assignment), "_user": user}   # "_user": for pin_login, not sent out
 
 
 class PinTokenAuthentication(BaseAuthentication):
@@ -813,10 +899,11 @@ def cancel_bill(*, bill, user, reason, manager_pin=None):
     bill.status, bill.cancel_reason = Bill.Status.CANCELLED, reason
     bill.cancelled_by, bill.cancelled_at = approver, timezone.now()
     bill.save(update_fields=["status", "cancel_reason", "cancelled_by", "cancelled_at", "updated_at"])
-    order = Order.objects.select_for_update().get(pk=bill.order_id)
-    order.status = Order.Status.SENT
-    order.version += 1
-    order.save(update_fields=["status", "version", "updated_at"])
+    if bill.order_id:
+        order = Order.objects.select_for_update().get(pk=bill.order_id)
+        order.status = Order.Status.SENT
+        order.version += 1
+        order.save(update_fields=["status", "version", "updated_at"])
     audit(approver, "bill_cancelled", bill, reason=reason)
     return bill
 
@@ -827,7 +914,7 @@ def take_payment(*, bill, user, method, amount, reference="", tendered=None, ide
     double-tap or network retry returns the original payment instead of paying twice."""
     drawer = _require_drawer(user)
     bill = Bill.objects.select_for_update().get(pk=bill.pk)
-    _check_bill_access(user, drawer, Order.objects.get(pk=bill.order_id))
+    _check_bill_access(user, drawer, bill.document)
     if idempotency_key:
         existing = Payment.objects.filter(idempotency_key=idempotency_key).first()
         if existing:
@@ -855,11 +942,12 @@ def take_payment(*, bill, user, method, amount, reference="", tendered=None, ide
     bill.amount_paid += amount
     if bill.balance == 0:
         bill.status, bill.paid_at = Bill.Status.PAID, timezone.now()
-        order = Order.objects.select_for_update().get(pk=bill.order_id)
-        order.status = Order.Status.PAID
-        order.version += 1
-        order.save(update_fields=["status", "version", "updated_at"])
-        release_table(order)
+        if bill.order_id:   # a room bill has no order to close; the booking just shows as paid
+            order = Order.objects.select_for_update().get(pk=bill.order_id)
+            order.status = Order.Status.PAID
+            order.version += 1
+            order.save(update_fields=["status", "version", "updated_at"])
+            release_table(order)
     bill.save()
     return payment
 
@@ -908,6 +996,9 @@ def day_blockers():
     n = Order.objects.filter(status__in=Order.OCCUPYING).count()
     if n:
         out.append(f"{n} order(s) still open or awaiting payment")
+    n = Bill.objects.filter(booking__isnull=False, status=Bill.Status.OPEN).count()
+    if n:
+        out.append(f"{n} room bill(s) awaiting payment")
     n = Shift.objects.filter(status=Shift.Status.OPEN).count()
     if n:
         out.append(f"{n} shift(s) still open")
@@ -917,7 +1008,7 @@ def day_blockers():
 def build_z_data(start, end):
     paid = Bill.objects.filter(status=Bill.Status.PAID, paid_at__gte=start, paid_at__lt=end)
     sums = paid.aggregate(net=Sum("subtotal"), tax=Sum("tax"), service=Sum("service_charge"),
-                          discounts=Sum("discount_amount"), total=Sum("total"))
+                          levy=Sum("levy"), discounts=Sum("discount_amount"), total=Sum("total"))
     by_cat = defaultdict(lambda: D(0))
     for b in paid:
         for ln in b.lines:
@@ -930,7 +1021,7 @@ def build_z_data(start, end):
                                              ended_at__gte=start, ended_at__lt=end)
     return {
         "sales": {"bills": paid.count(), "net": sums["net"] or 0, "tax": sums["tax"] or 0,
-                  "service_charge": sums["service"] or 0, "discounts": sums["discounts"] or 0,
+                  "service_charge": sums["service"] or 0, "levy": sums["levy"] or 0, "discounts": sums["discounts"] or 0,
                   "gross_total": sums["total"] or 0},
         "net_by_category": dict(by_cat),
         "payments_by_method": by_method,  # net of refunds
@@ -1055,10 +1146,13 @@ class BulkItemsIn(serializers.Serializer):
 
 
 def bill_data(b):
-    return {"id": b.id, "number": b.number, "order": b.order_id, "order_number": b.order.number,
+    o, bk = b.order, b.booking
+    who = o.waiter if o else bk.booked_by
+    return {"id": b.id, "number": b.number, "order": b.order_id, "order_number": o.number if o else None,
+            "booking": b.booking_id, "booking_number": bk.number if bk else None,
             "status": b.status, "created_at": b.created_at, "terminal": b.terminal,
-            "table": b.order.table.name if b.order.table_id else None, "waiter": b.order.waiter.get_full_name() or b.order.waiter.username, "lines": b.lines, "subtotal": b.subtotal, "discount": b.discount_amount,
-            "service_charge": b.service_charge, "tax": b.tax, "total": b.total, "paid": b.amount_paid,
+            "table": o.table.name if o and o.table_id else None, "waiter": who.get_full_name() or who.username, "lines": b.lines, "subtotal": b.subtotal, "discount": b.discount_amount,
+            "service_charge": b.service_charge, "levy": b.levy, "tax": b.tax, "total": b.total, "paid": b.amount_paid,
             "balance": b.balance,
             "payments": [{"id": p.id, "kind": p.kind, "method": p.method, "amount": p.amount,
                           "reference": p.reference, "change_due": p.change_due} for p in b.payments.all()]}
@@ -1069,7 +1163,7 @@ def render_receipt(bill, autoprint=False):
     Optional settings: POS_BUSINESS_NAME, POS_BUSINESS_ADDRESS, POS_BUSINESS_PHONE, POS_BUSINESS_TAX_ID, POS_RECEIPT_FOOTER."""
     g = lambda k, d="": getattr(settings, k, d)
     m = lambda x: f"{D(x):,.2f}"
-    order = bill.order
+    order, booking = bill.order, bill.booking
     rows = "".join(
         f"<tr><td>{l['quantity']} x {esc(l['name'])}" + "".join(f"<br>&nbsp;&nbsp;+ {esc(x)}" for x in l["modifiers"])
         + f"</td><td class=r>{m(l['line_total'])}</td></tr>" for l in bill.lines)
@@ -1079,7 +1173,9 @@ def render_receipt(bill, autoprint=False):
         t.append((f"Discount{' (' + esc(bill.discount_reason) + ')' if bill.discount_reason else ''}", -bill.discount_amount))
     if bill.service_charge:
         t.append(("Service charge", bill.service_charge))
-    t.append(("VAT included" if settings.PRICES_INCLUDE_TAX else "VAT", bill.tax))
+    if bill.levy:
+        t.append(("Catering levy", bill.levy))
+    t.append(("VAT" if booking else "VAT included" if settings.PRICES_INCLUDE_TAX else "VAT", bill.tax))
     pay = "".join(f"<tr><td>{p.get_method_display()}{' (' + esc(p.reference) + ')' if p.reference else ''}"
                   f"{' - refund' if p.kind == 'REFUND' else ''}</td><td class=r>{m(p.amount)}</td></tr>"
                   + (f"<tr><td>&nbsp;&nbsp;Change</td><td class=r>{m(p.change_due)}</td></tr>" if p.change_due > 0 else "")
@@ -1092,15 +1188,23 @@ def render_receipt(bill, autoprint=False):
              "REFUNDED": "REFUNDED"}.get(bill.status, "")
     head = "".join(f"<div class=c>{esc(g(k))}</div>" for k in ("POS_BUSINESS_ADDRESS", "POS_BUSINESS_PHONE") if g(k))
     taxid = f"<div class=c>PIN: {esc(g('POS_BUSINESS_TAX_ID'))}</div>" if g("POS_BUSINESS_TAX_ID") else ""
-    where = order.table.name if order.table_id else ("Bar" if order.source == "BAR" else "No table")
+    if order:
+        where = order.table.name if order.table_id else ("Bar" if order.source == "BAR" else "No table")
+        who = order.waiter.get_full_name() or order.waiter.username
+        meta = (f"<tr><td>Order</td><td class=r>{esc(order.number)}</td></tr>\n<tr><td>Table</td><td class=r>{esc(where)}</td></tr>"
+                f"<tr><td>Served by</td><td class=r>{esc(who)}</td></tr>")
+    else:
+        who = booking.booked_by.get_full_name() or booking.booked_by.username
+        meta = (f"<tr><td>Booking</td><td class=r>{esc(booking.number)}</td></tr>\n<tr><td>Guest</td><td class=r>{esc(booking.guest_name)}</td></tr>"
+                f"<tr><td>Stay</td><td class=r>{booking.check_in:%d %b} - {booking.check_out:%d %b %Y}</td></tr>"
+                f"<tr><td>Booked by</td><td class=r>{esc(who)}</td></tr>")
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>Bill {esc(bill.number)}</title><style>
 @page{{size:80mm auto;margin:3mm}}body{{font:12px/1.35 'Courier New',monospace;width:74mm;margin:0 auto;color:#000}}
 h1{{font-size:17px;text-align:center;margin:0}}.c{{text-align:center}}table{{width:100%;border-collapse:collapse}}td{{vertical-align:top;padding:1px 0}}
 td.r{{text-align:right;white-space:nowrap;padding-left:6px}}hr{{border:0;border-top:1px dashed #000;margin:6px 0}}
 .tot td{{font-weight:bold;font-size:15px}}.stamp{{text-align:center;border:2px solid #000;font-weight:bold;margin:8px 0;padding:3px}}</style></head><body>
 <h1>{esc(g('POS_BUSINESS_NAME', 'Nova PoS'))}</h1>{head}{taxid}<hr>
-<table><tr><td>Bill</td><td class=r>{esc(bill.number)}</td></tr><tr><td>Order</td><td class=r>{esc(order.number)}</td></tr>
-<tr><td>Table</td><td class=r>{esc(where)}</td></tr><tr><td>Served by</td><td class=r>{esc(order.waiter.get_full_name() or order.waiter.username)}</td></tr>
+<table><tr><td>Bill</td><td class=r>{esc(bill.number)}</td></tr>{meta}
 {cashier_row}<tr><td>Date</td><td class=r>{timezone.localtime(bill.created_at):%d %b %Y %H:%M}</td></tr></table><hr>
 <table>{rows}</table><hr><table>{"".join(f"<tr><td>{a}</td><td class=r>{m(b)}</td></tr>" for a, b in t)}
 <tr class=tot><td>TOTAL</td><td class=r>{m(bill.total)}</td></tr></table>
@@ -1147,8 +1251,10 @@ class POSView(APIView):
 POS_TEMPLATE = getattr(settings, "POS_TEMPLATE", "Chokies/pos.html")
 
 
-POS_LOGIN_TEMPLATE = getattr(settings, "POS_LOGIN_TEMPLATE", "pos_login.html")
+POS_LOGIN_TEMPLATE = getattr(settings, "POS_LOGIN_TEMPLATE", "Chokies/login.html")
 POS_HOME_URL = getattr(settings, "POS_HOME_URL", "/")
+POS_LOGIN_URL = getattr(settings, "POS_LOGIN_URL", "/pin-login/")        # same setting manager_views.py uses
+POS_MANAGER_HOME = getattr(settings, "POS_MANAGER_HOME", "manager:dashboard")   # URL name managers land on
 
 _FALLBACK_LOGIN = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Chokies POS - Sign in</title>
@@ -1168,11 +1274,52 @@ def _wants_json(request):
             or "application/json" in request.headers.get("Accept", "").split(",")[0])
 
 
+def _session_ok(user):
+    """A browser session is usable: signed in and, for waiters / cashiers, still on an open shift."""
+    return bool(user.is_authenticated and not (user.needs_shift and active_assignment(user) is None))
+
+
+def _manager_home():
+    try:
+        return reverse(POS_MANAGER_HOME)
+    except NoReverseMatch:
+        return POS_HOME_URL
+
+
+def landing_url(user):
+    """Where someone starts after signing in. Decided by who they are, not by anything they pick on the login page:
+    managers / admins -> the back office; waiters and cashiers (already checked to be on an open shift) -> the POS,
+    which then shows the waiter or cashier screen from their shift role."""
+    return _manager_home() if user.is_manager else POS_HOME_URL
+
+
+def _safe_next(request, nxt, user):
+    """Honour ?next= only if it stays on this site and the person is allowed there: a waiter or cashier is never
+    sent to a manager page that would answer 403, and nobody is sent back to the login page."""
+    if not nxt or not url_has_allowed_host_and_scheme(nxt, {request.get_host()}, request.is_secure()):
+        return None
+    path = urlsplit(nxt).path
+    if path.startswith(POS_LOGIN_URL):
+        return None
+    mgr = _manager_home()
+    # _manager_home() falls back to POS_HOME_URL ("/") when the manager URL cannot be reversed; every path starts with
+    # "/", so only apply this guard when there is a real, separate manager area.
+    if mgr != POS_HOME_URL and not user.is_manager and path.startswith(mgr):
+        return None
+    return nxt
+
+
 def _login_page(request, error="", username="", status=200):
-    ctx = {"error": error, "username": username, "next": request.GET.get("next") or request.POST.get("next", "")}
+    name = business_info()["name"]
+    first, _, rest = name.partition(" ")        # the logo shows the first word in one colour, the rest in another
+    ctx = {"error": error, "username": username, "next": request.GET.get("next") or request.POST.get("next", ""),
+           "business_name": name, "brand_first": first, "brand_rest": rest.strip(),
+           "login_image": getattr(settings, "POS_LOGIN_IMAGE", ""), "pin_length": POS_PIN_LENGTH}
     try:
         return render(request, POS_LOGIN_TEMPLATE, ctx, status=status)
     except TemplateDoesNotExist:
+        log.warning("Login template %r not found, showing the plain built-in form. Put login.html at "
+                    "Chokies/templates/Chokies/login.html or set POS_LOGIN_TEMPLATE.", POS_LOGIN_TEMPLATE)
         from django.utils.html import escape
         html = _FALLBACK_LOGIN % {"error": f'<div class="err">{escape(error)}</div>' if error else "",
                                   "username": escape(username), "next": escape(ctx["next"])}
@@ -1181,42 +1328,50 @@ def _login_page(request, error="", username="", status=200):
 
 @csrf_exempt
 def pin_login(request):
-    """The PIN login page.
+    """The one sign-in page for waiters, cashiers and managers: you select your PIN, nothing else.
 
-    GET  -> the sign-in page (template POS_LOGIN_TEMPLATE, or a built-in PIN form if you have none).
-    POST -> username + pin. Starts a Django session and also returns a token.
-            Browser form post: redirect to ?next= / POS_HOME_URL, or redisplay the form with the error.
-            JSON / AJAX post: JSON body (token + user) or {error, detail} with the HTTP status.
-    Same rules as the API: waiters/cashiers need an open shift."""
+    GET  -> the login page (template POS_LOGIN_TEMPLATE, or a built-in form if it is missing).
+    POST -> {pin, next?}. The server finds who owns the PIN, checks their role and, for waiters / cashiers, that they are
+            on an open shift (same rules as the API), starts a Django session and works out where they start:
+              manager / admin -> back office       waiter / cashier -> POS (screen chosen from their shift role)
+            JSON / AJAX post: {token, user, role, redirect}, or {error, detail} with the HTTP status.
+            Browser form post: redirect there, or redisplay the form with the error.
+            (An optional `username` still selects the older username + PIN check, for scripts and the built-in form.)"""
     if request.method == "GET":
         return _login_page(request)
     if request.method != "POST":
         return HttpResponse(status=405, headers={"Allow": "GET, POST"})
+    username = ""
     try:
         data = json.loads(request.body) if request.content_type == "application/json" else request.POST
-        username, pin = str(data.get("username", "")), str(data.get("pin", ""))
-        result = authenticate_pin(username=username, pin=pin)
+        username, pin = str(data.get("username", "")).strip(), str(data.get("pin", ""))
+        nxt = str(data.get("next") or "")
+        result = (authenticate_pin(username=username, pin=pin) if username
+                  else authenticate_by_pin(pin=pin, request=request))
     except (ValueError, AttributeError):
-        return JsonResponse({"error": "BadRequest", "detail": "Send username and pin"}, status=400)
+        return JsonResponse({"error": "BadRequest", "detail": "Send the pin"}, status=400)
     except DomainError as e:
         if _wants_json(request):
             return JsonResponse({"error": e.__class__.__name__, "detail": str(e)}, status=e.status_code)
         return _login_page(request, error=str(e), username=username, status=e.status_code)
-    user = User.objects.get(pk=result["user"]["id"])
+    user = result.pop("_user", None) or User.objects.get(pk=result["user"]["id"])      # PIN-only sign-in already has the user
     django_login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+    shift = result["user"]["shift"]
+    result["role"] = "manager" if user.is_manager else (shift["role"] if shift else user.role).lower()
+    result["redirect"] = _safe_next(request, nxt, user) or landing_url(user)
     if _wants_json(request):
         return JsonResponse(result)
-    nxt = request.POST.get("next", "")
-    ok = nxt and url_has_allowed_host_and_scheme(nxt, {request.get_host()}, request.is_secure())
-    return redirect(nxt if ok else POS_HOME_URL)
+    return redirect(result["redirect"])
 
 
 @ensure_csrf_cookie
 def pos_page(request):
-    """Serves the POS single page. Context: `pos_user` is None until someone has logged in."""
+    """Serves the POS single page. Signing in happens on the login page only: anyone without a valid session
+    (never signed in, or their shift has ended) is sent there."""
     user = request.user
-    ok = user.is_authenticated and not (user.needs_shift and active_assignment(user) is None)
-    return render(request, POS_TEMPLATE, {"pos_user": user_payload(user) if ok else None})
+    if not _session_ok(user):
+        return redirect(POS_LOGIN_URL)
+    return render(request, POS_TEMPLATE, {"pos_user": user_payload(user), "login_url": POS_LOGIN_URL})
 
 
 class PinLoginView(POSView):
@@ -1241,18 +1396,6 @@ class LogoutView(POSView):
 class MeView(POSView):
     def get(self, request):
         return Response(user_payload(request.user))
-
-
-class RosterView(POSView):
-    """Who is on an open shift right now: feeds the 'tap your name, enter PIN' login screen."""
-    authentication_classes = []
-    permission_classes = [AllowAny]
-
-    def get(self, request):
-        rows = (ShiftAssignment.objects.filter(ended_at__isnull=True, shift__status=Shift.Status.OPEN,
-                                               user__is_active=True).select_related("user", "shift"))
-        return Response([{"username": a.user.username, "name": a.user.get_full_name() or a.user.username,
-                          "role": a.role, "shift": a.shift.name or f"Shift #{a.shift_id}"} for a in rows])
 
 
 # ---------- shifts ----------
@@ -1336,8 +1479,10 @@ class MySalesView(POSView):
         empty = {"summary": {"count": 0, "total": "0.00", "by_method": {}}, "bills": []}
         if a is None:
             return Response(empty)
-        bills = list(Bill.objects.filter(status=Bill.Status.PAID, order__waiter=request.user, order__shift_id=a.shift_id)
-                     .select_related("order__table").prefetch_related("payments", "order__items")
+        bills = list(Bill.objects.filter(Q(order__waiter=request.user, order__shift_id=a.shift_id)
+                                         | Q(booking__booked_by=request.user, booking__shift_id=a.shift_id),
+                                         status=Bill.Status.PAID)
+                     .select_related("order__table", "booking").prefetch_related("payments", "order__items")
                      .order_by("-paid_at", "-id"))
         rows, by_method, total = [], defaultdict(Decimal), Decimal(0)
         for b in bills:
@@ -1348,10 +1493,11 @@ class MySalesView(POSView):
                 if p.kind == Payment.Kind.PAYMENT and p.method not in methods:
                     methods.append(p.method)
             total += b.total
-            rows.append({"id": b.id, "number": b.number, "order": o.id, "order_number": o.number, "source": o.source,
-                         "table": o.table.name if o.table_id else None, "paid_at": b.paid_at, "total": b.total,
+            rows.append({"id": b.id, "number": b.number, "order": b.order_id, "booking": b.booking_id,
+                         "order_number": o.number if o else b.booking.number, "source": o.source if o else "ROOM",
+                         "table": o.table.name if o and o.table_id else None, "paid_at": b.paid_at, "total": b.total,
                          "methods": methods,
-                         "items": sum(i.quantity for i in o.items.all() if i.status != "VOID")})
+                         "items": sum(i.quantity for i in o.items.all() if i.status != "VOID") if o else len(b.lines)})
         return Response(clean({"summary": {"count": len(rows), "total": total, "by_method": dict(by_method)}, "bills": rows}))
 
 
@@ -1570,8 +1716,9 @@ class BillOrderView(POSView):
 
 
 def _visible_bill(request, pk):
-    bill = get_object_or_404(Bill.objects.select_related("order__table", "order__waiter"), pk=pk)
-    if request.user.role == User.Role.WAITER and not request.user.is_manager and bill.order.waiter_id != request.user.pk:
+    bill = get_object_or_404(Bill.objects.select_related("order__table", "order__waiter", "booking__booked_by"), pk=pk)
+    owner = bill.order.waiter_id if bill.order_id else bill.booking.booked_by_id
+    if request.user.role == User.Role.WAITER and not request.user.is_manager and owner != request.user.pk:
         raise ManagerApprovalRequired("This bill belongs to another waiter's order")
     return bill
 
@@ -1589,7 +1736,7 @@ class BillReceiptView(POSView):
     def get(self, request, pk):
         u = request.user
         if u.is_manager or active_assignment(u, Role.CASHIER):
-            bill = get_object_or_404(Bill.objects.select_related("order__table", "order__waiter"), pk=pk)
+            bill = get_object_or_404(Bill.objects.select_related("order__table", "order__waiter", "booking__booked_by"), pk=pk)
         else:
             _require_assignment(u, Role.WAITER)
             bill = _visible_bill(request, pk)   # also refuses another waiter's bill
@@ -1606,7 +1753,7 @@ class BillListView(POSView):
     def get(self, request):
         _require_cashier(request.user, "The paid-bills list")
         bills = list(Bill.objects.filter(status=Bill.Status.PAID, payments__drawer__shift__status=Shift.Status.OPEN)
-                     .select_related("order__table", "order__waiter").distinct().order_by("-paid_at", "-id")[:200])
+                     .select_related("order__table", "order__waiter", "booking__booked_by").distinct().order_by("-paid_at", "-id")[:200])
         prints = {}
         for log in AuditLog.objects.filter(action="bill_printed", ref_type="Bill",
                                            ref_id__in=[str(b.pk) for b in bills]).select_related("user").order_by("created_at"):
@@ -1615,10 +1762,12 @@ class BillListView(POSView):
         for b in bills:
             after = [p for p in prints.get(str(b.pk), []) if b.paid_at and p.created_at >= b.paid_at]   # prints before payment don't count
             last = after[-1] if after else None
-            o = b.order
-            rows.append({"id": b.id, "number": b.number, "order": o.id, "order_number": o.number, "source": o.source,
-                         "table": o.table.name if o.table_id else None, "waiter": o.waiter_id,
-                         "waiter_name": o.waiter.get_full_name() or o.waiter.username, "total": b.total, "paid_at": b.paid_at,
+            o, bk = b.order, b.booking
+            who = o.waiter if o else bk.booked_by
+            rows.append({"id": b.id, "number": b.number, "order": b.order_id, "order_number": o.number if o else bk.number,
+                         "booking": b.booking_id, "source": o.source if o else "ROOM",
+                         "table": o.table.name if o and o.table_id else None, "waiter": who.id,
+                         "waiter_name": who.get_full_name() or who.username, "total": b.total, "paid_at": b.paid_at,
                          "printed": len(after), "last_printed_at": last.created_at if last else None,
                          "last_printed_by": (last.user.get_full_name() or last.user.username) if last and last.user else None})
         return Response(clean(rows))
@@ -1763,9 +1912,9 @@ class MpesaStkView(POSView):
 
     def post(self, request):
         d = request.data
-        bill = get_object_or_404(Bill.objects.select_related("order"), pk=d.get("bill"))
+        bill = get_object_or_404(Bill.objects.select_related("order", "booking"), pk=d.get("bill"))
         drawer = _require_drawer(request.user)
-        _check_bill_access(request.user, drawer, bill.order)
+        _check_bill_access(request.user, drawer, bill.document)
         if bill.status != Bill.Status.OPEN:
             raise InvalidState(f"Bill {bill.number} is {bill.get_status_display().lower()}")
         amount = _money(d.get("amount"))
@@ -1852,7 +2001,7 @@ class PayView(POSView):
         if entry and entry.get("status") == "SUCCESS":
             entry.update(status="USED", used_key=key)
             cache.set(_stk_key(stk_id), entry, STK_TTL)
-        bill = Bill.objects.select_related("order").get(pk=pk)
+        bill = Bill.objects.select_related("order", "booking").get(pk=pk)
         return Response(clean({**bill_data(bill), "change_due": p.change_due}), status=201)
 
 
@@ -1864,7 +2013,7 @@ class RefundView(POSView):
         refund_payment(payment=payment, user=request.user, reason=d.get("reason", ""),
                        amount=None if amount in (None, "") else _money(amount),
                        manager_pin=d.get("manager_pin"))
-        return Response(clean(bill_data(Bill.objects.select_related("order").get(pk=payment.bill_id))))
+        return Response(clean(bill_data(Bill.objects.select_related("order", "booking").get(pk=payment.bill_id))))
 
 
 class ZPreviewView(POSView):
@@ -2057,3 +2206,388 @@ def receive_goods(*, po, location, user, lines, invoice_no=""):
     po.save(update_fields=["status", "updated_at"])
     audit(user, "goods_received", receipt, po=po.number, invoice=invoice_no)
     return receipt
+
+
+# =============================================================================
+# Rooms: availability, booking, billing, check-in / check-out
+# =============================================================================
+# A booking is billed and paid through the same Bill / Payment / drawer code as an order: its Bill has
+# booking set and order empty. Optional settings: ROOM_VAT_PERCENT (default 16), ROOM_LEVY_PERCENT (default 2,
+# the catering levy). Room rates are per night and EXCLUDE both; the bill adds them on top.
+
+ROOM_NOTES = {Room.Status.CLEANING: "The room is still under cleaning.", Room.Status.MAINTENANCE: "The room is out of service."}
+MAX_STAY_NIGHTS = 90
+
+
+def _room_vat():
+    return D(str(getattr(settings, "ROOM_VAT_PERCENT", 16)))
+
+
+def _room_levy():
+    return D(str(getattr(settings, "ROOM_LEVY_PERCENT", 2)))
+
+
+def _date(value, field):
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        raise InvalidState(f"{field} must be a date like 2026-10-08")
+
+
+def room_conflicts(room_ids, check_in, check_out, exclude=None):
+    """Active bookings that already hold any of these rooms on any night of [check_in, check_out)."""
+    qs = RoomBookingLine.objects.filter(room_id__in=room_ids, booking__status__in=RoomBooking.ACTIVE,
+                                        booking__check_in__lt=check_out, booking__check_out__gt=check_in
+                                        ).select_related("room", "booking")
+    return qs.exclude(booking=exclude) if exclude else qs
+
+
+def room_amounts(booking):
+    """What the stay costs: nights x nightly rate per room, then VAT on each line and the levy on the net."""
+    nights, vat = booking.nights, _room_vat()
+    lines, net_sum, tax_sum = [], D(0), D(0)
+    for l in sorted(booking.lines.all(), key=lambda x: x.id):
+        net = q(l.unit_price * nights)
+        tax = q(net * vat / 100)
+        net_sum += net
+        tax_sum += tax
+        lines.append({"name": f"{l.room.name} ({l.get_meal_plan_display()})", "category": "Accommodation", "quantity": nights,
+                      "unit_price": str(l.unit_price), "line_total": str(net), "modifiers": [], "tax_rate": str(vat),
+                      "net": str(net), "tax": str(tax), "room": l.room.name, "meal_plan": l.meal_plan})
+    levy = q(net_sum * _room_levy() / 100)
+    return {"lines": lines, "subtotal": net_sum, "tax": tax_sum, "levy": levy, "total": net_sum + tax_sum + levy}
+
+
+def _check_booking_access(user, booking):
+    """Waiters work on their own bookings; cashiers and managers on any."""
+    a = active_assignment(user)
+    if a is not None and a.role == Role.WAITER and not user.is_manager and booking.booked_by_id != user.pk:
+        raise ManagerApprovalRequired(f"Booking {booking.number} belongs to another waiter")
+
+
+def _booking_actor(user):
+    if not user.is_manager and active_assignment(user) is None:
+        raise NotOnShift("You are not on an open shift. Ask a manager to add you.")
+
+
+def _live_bill(booking):
+    return next((b for b in booking.bills.all() if b.status in (Bill.Status.OPEN, Bill.Status.PAID)), None)
+
+
+@transaction.atomic
+def generate_booking_bill(*, booking, user):
+    """One bill per booking, numbered from the user's terminal (or the shared WTR series), paid into their drawer."""
+    drawer = _require_drawer(user)
+    booking = RoomBooking.objects.select_for_update().get(pk=booking.pk)
+    _check_bill_access(user, drawer, booking)
+    if booking.status not in RoomBooking.ACTIVE:
+        raise InvalidState(f"Booking {booking.number} is {booking.get_status_display().lower()}")
+    if booking.bills.filter(status__in=[Bill.Status.OPEN, Bill.Status.PAID]).exists():
+        raise InvalidState("This booking already has a bill")
+    a = room_amounts(booking)
+    terminal = drawer.terminal or "WTR"
+    return Bill.objects.create(
+        number=DocumentSequence.next(f"bill-{terminal}", f"{terminal}-B"), booking=booking, terminal=terminal,
+        lines=a["lines"], subtotal=a["subtotal"], tax=a["tax"], levy=a["levy"], total=a["total"], created_by=user)
+
+
+@transaction.atomic
+def create_booking(*, user, guest_name, phone, check_in, check_out, rooms, occupants=1, narrative="", payment=None):
+    """Book one or more rooms for a guest. `rooms` = [{"room": id, "meal_plan": "BNB"}]. With `payment`
+    ({"method", "amount", "reference", "tendered", "idempotency_key"}) the bill is created and the money taken in
+    the same step, so a failed payment leaves no booking behind."""
+    drawer = _require_drawer(user)
+    key = (payment or {}).get("idempotency_key")
+    if key and Payment.objects.filter(idempotency_key=key).exists():   # a retry after a lost reply: never book (and charge) twice
+        raise InvalidState("This booking was already submitted. Check the Bookings list")
+    guest_name, phone = (guest_name or "").strip(), (phone or "").strip()
+    if not guest_name:
+        raise InvalidState("Enter the guest's full name")
+    if not phone:
+        raise InvalidState("Enter the guest's phone number")
+    if check_in < timezone.localdate():
+        raise InvalidState("Check-in cannot be in the past")
+    if check_out <= check_in:
+        raise InvalidState("Check-out must be after check-in")
+    if (check_out - check_in).days > MAX_STAY_NIGHTS:
+        raise InvalidState(f"A stay can be at most {MAX_STAY_NIGHTS} nights")
+    if not rooms:
+        raise InvalidState("Add at least one room")
+    ids = [r["room"] for r in rooms]
+    if len(set(ids)) != len(ids):
+        raise InvalidState("Each room can only be added once")
+    found = {r.pk: r for r in Room.objects.select_for_update().filter(pk__in=ids, is_active=True)}   # locks the rooms: two clerks cannot take the same one
+    picked = []
+    for r in rooms:
+        room = found.get(r["room"])
+        if room is None:
+            raise InvalidState("That room does not exist")
+        if room.status == Room.Status.MAINTENANCE:
+            raise RoomUnavailable(f"{room.name} is out of service")
+        if room.rate(r["meal_plan"]) <= 0:
+            raise InvalidState(f"{room.name} is not offered on {MealPlan(r['meal_plan']).label.lower()}")
+        picked.append((room, r["meal_plan"]))
+    clash = room_conflicts(ids, check_in, check_out).first()
+    if clash:
+        b = clash.booking
+        raise RoomUnavailable(f"{clash.room.name} is already booked {b.check_in:%d %b} to {b.check_out:%d %b} ({b.number})")
+
+    booking = RoomBooking.objects.create(number=DocumentSequence.next("booking", "BK-"), guest_name=guest_name, phone=phone,
+                                         occupants=occupants, narrative=narrative or "", check_in=check_in, check_out=check_out,
+                                         shift=drawer.shift, booked_by=user)
+    RoomBookingLine.objects.bulk_create([RoomBookingLine(booking=booking, room=room, meal_plan=plan, unit_price=room.rate(plan))
+                                         for room, plan in picked])
+    audit(user, "booking_created", booking, rooms=[r.name for r, _ in picked], nights=booking.nights, guest=guest_name)
+    if payment:
+        bill = generate_booking_bill(booking=booking, user=user)
+        take_payment(bill=bill, user=user, **payment)
+    return booking
+
+
+@transaction.atomic
+def cancel_booking(*, booking, user, reason):
+    _booking_actor(user)
+    booking = RoomBooking.objects.select_for_update().get(pk=booking.pk)
+    _check_booking_access(user, booking)
+    if booking.status == RoomBooking.Status.CHECKED_IN:
+        raise InvalidState("The guest is already in the room. Check them out instead")
+    if booking.status != RoomBooking.Status.RESERVED:
+        raise InvalidState(f"Booking {booking.number} is {booking.get_status_display().lower()}")
+    if not (reason or "").strip():
+        raise InvalidState("A reason is required")
+    live = booking.bills.filter(status__in=[Bill.Status.OPEN, Bill.Status.PAID]).first()
+    if live:
+        raise InvalidState(f"Refund the payments on bill {live.number} first" if live.amount_paid else f"Cancel bill {live.number} first")
+    booking.status, booking.cancel_reason = RoomBooking.Status.CANCELLED, reason.strip()[:200]
+    booking.save(update_fields=["status", "cancel_reason", "updated_at"])
+    audit(user, "booking_cancelled", booking, reason=booking.cancel_reason)
+    return booking
+
+
+@transaction.atomic
+def check_in_booking(*, booking, user):
+    _booking_actor(user)
+    booking = RoomBooking.objects.select_for_update().get(pk=booking.pk)
+    _check_booking_access(user, booking)
+    if booking.status != RoomBooking.Status.RESERVED:
+        raise InvalidState(f"Booking {booking.number} is {booking.get_status_display().lower()}")
+    if timezone.localdate() < booking.check_in:
+        raise InvalidState(f"Check-in is on {booking.check_in:%d %b %Y}")
+    not_ready = [l.room.name for l in booking.lines.select_related("room") if l.room.status != Room.Status.AVAILABLE]
+    if not_ready:
+        raise RoomUnavailable(f"{', '.join(not_ready)} not ready yet (cleaning or out of service)")
+    booking.status, booking.checked_in_at = RoomBooking.Status.CHECKED_IN, timezone.now()
+    booking.save(update_fields=["status", "checked_in_at", "updated_at"])
+    audit(user, "guest_checked_in", booking)
+    return booking
+
+
+@transaction.atomic
+def check_out_booking(*, booking, user):
+    """Needs the bill settled in full. The rooms then go to housekeeping (Being cleaned)."""
+    _booking_actor(user)
+    booking = RoomBooking.objects.select_for_update().get(pk=booking.pk)
+    _check_booking_access(user, booking)
+    if booking.status != RoomBooking.Status.CHECKED_IN:
+        raise InvalidState(f"Booking {booking.number} is {booking.get_status_display().lower()}")
+    bill = booking.bills.filter(status__in=[Bill.Status.OPEN, Bill.Status.PAID]).first()
+    if bill is None or bill.status != Bill.Status.PAID:
+        raise InvalidState("Settle the bill in full before check-out" + (f" (balance {bill.balance})" if bill else ""))
+    booking.status, booking.checked_out_at = RoomBooking.Status.CHECKED_OUT, timezone.now()
+    booking.save(update_fields=["status", "checked_out_at", "updated_at"])
+    Room.objects.filter(booking_lines__booking=booking).update(status=Room.Status.CLEANING)
+    audit(user, "guest_checked_out", booking)
+    return booking
+
+
+def set_room_status(*, room, user, status):
+    _booking_actor(user)
+    if status not in Room.Status.values:
+        raise InvalidState(f"Unknown room status {status}")
+    if status == Room.Status.MAINTENANCE:
+        _require_manager(user, "Taking a room out of service")
+    room.status = status
+    room.save(update_fields=["status", "updated_at"])
+    audit(user, "room_status", room, status=status)
+    return room
+
+
+# ---------- serializers ----------
+
+def booking_data(b):
+    """One booking for the list and the booking page (use _booking_qs so lines, rooms and bills are prefetched)."""
+    live = _live_bill(b)
+    a = room_amounts(b)
+    total = live.total if live else a["total"]
+    paid = live.amount_paid if live else D(0)
+    state = ("UNBILLED" if not live else "PAID" if live.status == Bill.Status.PAID else "PART" if paid > 0 else "UNPAID")
+    if not live and any(x.status == Bill.Status.REFUNDED for x in b.bills.all()):
+        state = "REFUNDED"
+    return {"id": b.id, "number": b.number, "guest_name": b.guest_name, "phone": b.phone, "occupants": b.occupants,
+            "narrative": b.narrative, "check_in": b.check_in, "check_out": b.check_out, "nights": b.nights,
+            "status": b.status, "cancel_reason": b.cancel_reason, "created_at": b.created_at,
+            "checked_in_at": b.checked_in_at, "checked_out_at": b.checked_out_at,
+            "waiter": b.booked_by_id, "waiter_name": b.booked_by.get_full_name() or b.booked_by.username,
+            "rooms": [l.room.name for l in sorted(b.lines.all(), key=lambda x: x.id)],
+            "lines": [{"room": l.room_id, "name": l.room.name, "meal_plan": l.meal_plan, "unit_price": l.unit_price}
+                      for l in sorted(b.lines.all(), key=lambda x: x.id)],
+            "total": total, "paid": paid, "balance": total - paid, "pay_state": state, "bill_id": live.id if live else None}
+
+
+def _booking_qs():
+    return RoomBooking.objects.select_related("booked_by").prefetch_related("lines__room", "bills")
+
+
+def booking_page(b):
+    """Everything the booking page needs in one call (same shape as the order page)."""
+    b = _booking_qs().get(pk=b.pk)
+    bill = _live_bill(b) or next((x for x in sorted(b.bills.all(), key=lambda x: x.created_at, reverse=True)
+                                  if x.status == Bill.Status.REFUNDED), None)
+    if bill:
+        payments = [{"id": p.id, "kind": p.kind, "method": p.method, "amount": p.amount, "reference": p.reference,
+                     "tendered": p.tendered, "change_due": p.change_due, "created_at": p.created_at,
+                     "by": p.user.get_full_name() or p.user.username}
+                    for p in bill.payments.select_related("user").order_by("created_at", "id")]
+        totals = {"subtotal": bill.subtotal, "tax": bill.tax, "levy": bill.levy, "total": bill.total,
+                  "paid": bill.amount_paid, "balance": bill.balance}
+        lines = bill.lines
+        meta = {"id": bill.id, "number": bill.number, "status": bill.status, "terminal": bill.terminal,
+                "created_at": bill.created_at, "paid_at": bill.paid_at}
+    else:
+        a = room_amounts(b)   # a preview: nothing is saved until the booking is billed
+        lines, payments, meta = a["lines"], [], None
+        totals = {"subtotal": a["subtotal"], "tax": a["tax"], "levy": a["levy"], "total": a["total"], "paid": D(0), "balance": a["total"]}
+    return clean({"booking": booking_data(b), "bill": meta, "lines": lines, "totals": totals, "payments": payments,
+                  "business": business_info(), "vat_percent": _room_vat(), "levy_percent": _room_levy()})
+
+
+class RoomLineIn(serializers.Serializer):
+    room = serializers.IntegerField(min_value=1)
+    meal_plan = serializers.ChoiceField(choices=MealPlan.values)
+
+
+class BookingPaymentIn(serializers.Serializer):
+    method = serializers.ChoiceField(choices=Payment.Method.values)
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=D("0.01"))
+    reference = serializers.CharField(max_length=80, required=False, allow_blank=True, default="")
+    tendered = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, default=None)
+    idempotency_key = serializers.CharField(max_length=64, required=False, allow_null=True, allow_blank=True, default=None)
+
+
+class BookingCreateIn(serializers.Serializer):
+    guest_name = serializers.CharField(max_length=150)
+    phone = serializers.CharField(max_length=30)
+    occupants = serializers.IntegerField(min_value=1, max_value=20, default=1)
+    narrative = serializers.CharField(max_length=300, required=False, allow_blank=True, default="")
+    check_in = serializers.DateField()
+    check_out = serializers.DateField()
+    rooms = RoomLineIn(many=True, allow_empty=False, max_length=30)
+    payment = BookingPaymentIn(required=False, allow_null=True, default=None)
+
+
+# ---------- API views ----------
+
+class RoomListView(POSView):
+    """Rooms with their rates and whether each is free for the dates asked (?from=YYYY-MM-DD&to=YYYY-MM-DD)."""
+
+    def get(self, request):
+        today = timezone.localdate()
+        check_in = _date(request.query_params.get("from") or today, "From date")
+        check_out = _date(request.query_params.get("to") or check_in + timedelta(days=1), "To date")
+        if check_out <= check_in:
+            check_out = check_in + timedelta(days=1)
+        rooms = list(Room.objects.filter(is_active=True))
+        held = {}
+        for c in room_conflicts([r.pk for r in rooms], check_in, check_out):
+            held.setdefault(c.room_id, c.booking)
+        out = []
+        for r in rooms:
+            b = held.get(r.pk)
+            out.append({"id": r.id, "name": r.name, "room_type": r.room_type, "capacity": r.capacity, "status": r.status,
+                        "note": ROOM_NOTES.get(r.status, ""), "rates": {k: v for k, v in r.rates.items() if v > 0},
+                        "booked": b is not None, "booking": b.number if b else None, "guest": b.guest_name if b else None,
+                        "until": b.check_out if b else None, "booking_id": b.id if b else None})
+        return Response(clean({"from": check_in, "to": check_out, "nights": (check_out - check_in).days, "rooms": out}))
+
+
+class RoomStatusView(POSView):
+    def post(self, request, pk):
+        room = set_room_status(room=get_object_or_404(Room, pk=pk), user=request.user, status=request.data.get("status"))
+        return Response({"id": room.id, "status": room.status, "note": ROOM_NOTES.get(room.status, "")})
+
+
+class GuestLookupView(POSView):
+    """\"Find customer\": guests from earlier bookings, matched on name or phone."""
+
+    def get(self, request):
+        term = (request.query_params.get("q") or "").strip()
+        if len(term) < 2:
+            return Response([])
+        seen, out = set(), []
+        for b in RoomBooking.objects.filter(Q(guest_name__icontains=term) | Q(phone__icontains=term)).order_by("-created_at")[:60]:
+            if b.phone in seen:
+                continue
+            seen.add(b.phone)
+            out.append({"guest_name": b.guest_name, "phone": b.phone, "narrative": b.narrative, "occupants": b.occupants})
+            if len(out) == 8:
+                break
+        return Response(out)
+
+
+def _visible_booking(request, pk):
+    b = get_object_or_404(_booking_qs(), pk=pk)
+    if request.user.role == User.Role.WAITER and not request.user.is_manager and b.booked_by_id != request.user.pk:
+        raise ManagerApprovalRequired("This booking belongs to another waiter")
+    return b
+
+
+class BookingListCreateView(POSView):
+    def get(self, request):
+        """Bookings still active plus anything made in the last 90 days. Waiters see their own; cashiers and managers see all."""
+        since = timezone.now() - timedelta(days=90)
+        qs = _booking_qs().filter(Q(created_at__gte=since) | Q(status__in=RoomBooking.ACTIVE)).order_by("-created_at")[:500]
+        rows = [booking_data(b) for b in qs
+                if not (request.user.role == User.Role.WAITER and not request.user.is_manager and b.booked_by_id != request.user.pk)]
+        return Response(clean(rows))
+
+    def post(self, request):
+        d = BookingCreateIn(data=request.data)
+        d.is_valid(raise_exception=True)
+        f = dict(d.validated_data)
+        f["rooms"] = [dict(r) for r in f["rooms"]]
+        pay = f.pop("payment", None)
+        if pay:
+            pay = dict(pay)
+            if pay["method"] != Payment.Method.CASH:
+                pay["tendered"] = None
+        b = create_booking(user=request.user, payment=pay, **f)
+        return Response(booking_page(b), status=201)
+
+
+class BookingDetailView(POSView):
+    def get(self, request, pk):
+        return Response(booking_page(_visible_booking(request, pk)))
+
+
+class BookingBillView(POSView):
+    def post(self, request, pk):
+        generate_booking_bill(booking=_visible_booking(request, pk), user=request.user)
+        return Response(booking_page(get_object_or_404(RoomBooking, pk=pk)), status=201)
+
+
+class BookingCheckInView(POSView):
+    def post(self, request, pk):
+        check_in_booking(booking=_visible_booking(request, pk), user=request.user)
+        return Response(booking_page(get_object_or_404(RoomBooking, pk=pk)))
+
+
+class BookingCheckOutView(POSView):
+    def post(self, request, pk):
+        check_out_booking(booking=_visible_booking(request, pk), user=request.user)
+        return Response(booking_page(get_object_or_404(RoomBooking, pk=pk)))
+
+
+class BookingCancelView(POSView):
+    def post(self, request, pk):
+        cancel_booking(booking=_visible_booking(request, pk), user=request.user, reason=request.data.get("reason", ""))
+        return Response(booking_page(get_object_or_404(RoomBooking, pk=pk)))

@@ -88,3 +88,5 @@ LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "pos"
 LOGOUT_REDIRECT_URL = "login"
 POS_LOGIN_URL = "/login/"
+# The one sign-in page for waiters, cashiers and managers: Chokies/templates/Chokies/login.html
+POS_LOGIN_TEMPLATE = "Chokies/login.html"

@@ -1,49 +1,159 @@
-{% load static %}<!doctype html>
+<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in - Chokies Lounge</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-<link href="{% static 'Chokies/pos.css' %}" rel="stylesheet"></head>
-<body class="login-body" data-next="{{ next }}">
+<title>Sign in - {{ business_name|default:"Nova PoS" }}</title>
+<!--
+  The one sign-in page for waiters, cashiers and managers. You only select your PIN: no name, no username, no role.
+  The server (pin_login in views.py) finds who owns the PIN, checks their role and, for waiters / cashiers, that they
+  are on an open shift, then sends them to the right place:
+      manager / admin  ->  back office        waiter / cashier  ->  POS (waiter or cashier screen, from the shift)
+  Markup, styles and script are all in this file.
+  View context: error, next, business_name, brand_first, brand_rest, login_image (optional, settings.POS_LOGIN_IMAGE).
+  When login_image is empty the photo below is loaded from Unsplash (free to use, no attribution needed; photo by Kouji Tsuru).
+  It is a large (1600px) image so it stays sharp; there is no blur and only a very light shade over it.
+-->
+<style>
+  :root{--teal:#1b7f7c;--teal-d:#14625f;--red:#b3182b;--green:#2e8b4a;--green-d:#216a37;--green-h:#38a259;--maroon:#7a1020;--logo-red:#a50f0f;
+        --ink:#16302f;--mut:#5e7473;--line:#cfe3e1;--bg:#f2f8f8}
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%}
+  body{min-height:100vh;display:flex;flex-direction:column;color:var(--ink);border-top:4px solid var(--teal);
+       font:15px/1.4 "Segoe UI",Inter,system-ui,sans-serif;touch-action:manipulation;
+       background:linear-gradient(#e7f3f2,#f4f9f9 45%,var(--bg))}
+  button,input{font:inherit;color:inherit}
+  :focus-visible{outline:3px solid #1b7f7c66;outline-offset:2px}
+  .hidden{display:none!important}
+
+  main{flex:1;display:grid;place-items:center;padding:2rem 1rem 5rem}
+  .card{width:min(100%,860px);min-height:460px;display:grid;grid-template-columns:42% 1fr;background:#fff;
+        border-radius:24px;overflow:hidden;box-shadow:0 20px 50px #0b3b3a26}
+
+  /* left: the number keys over the picture */
+  .keys{display:grid;grid-template-columns:repeat(6,1fr);gap:.85rem;align-content:center;padding:1.4rem;
+        background-color:#4a3a2e;background-size:cover;background-position:center;
+        background-image:radial-gradient(150px 110px at 72% 18%,#f6ead2d9,transparent 70%),
+                         radial-gradient(220px 140px at 20% 85%,#d9c3a066,transparent 70%),
+                         linear-gradient(160deg,#2b2320,#5a4637 55%,#9c846a)}
+  .key{grid-column:span 2;min-height:clamp(60px,10vh,80px);border:0;border-radius:18px;background:var(--teal);color:#fff;
+       font-size:1.5rem;font-weight:800;cursor:pointer;transition:background .12s,transform .08s;box-shadow:0 2px 0 #00000026}
+  .key.wide{grid-column:span 3}
+  .key.aux{font-size:1.05rem}
+  .key:hover:not(:disabled){background:var(--teal-d)}
+  .key:active:not(:disabled){background:var(--green-d);transform:scale(.97)}
+  .key:disabled{opacity:.6;cursor:default}
+
+  /* right: sign in */
+  .form{display:grid;align-content:center;gap:1rem;padding:2.6rem 3rem}
+  .logo{margin:0 0 .6rem;font-size:clamp(2.2rem,5.2vw,3.3rem);line-height:1;font-weight:800;letter-spacing:-.03em;overflow-wrap:anywhere}
+  .logo .a{color:var(--teal)}.logo .b{color:var(--logo-red)}
+  .flash{padding:.65rem .85rem;border-radius:12px;background:#1b7f7c14;border:1px solid #1b7f7c40;color:var(--teal-d);font-size:.88rem}
+  h2{margin:0;font-size:1.3rem;font-weight:600}
+  #pin{width:100%;height:54px;padding:0 1rem;border:1px solid var(--line);border-radius:12px;background:#fbfdfd;
+       font-size:1.5rem;letter-spacing:.4em;color:var(--ink);cursor:default}
+  #pin::placeholder{font-size:.95rem;font-weight:700;letter-spacing:.28em;color:#8a9b9a}
+  #pin:focus{outline:2px solid var(--teal);border-color:transparent}
+  .go{justify-self:start;display:inline-flex;align-items:center;gap:.6rem;padding:.8rem 1.5rem;border-radius:10px;
+      border:1px solid var(--teal);background:var(--teal);color:#fff;font-weight:700;cursor:pointer;transition:background .12s}
+  .go:hover:not(:disabled){background:var(--teal-d)}
+  .go:disabled{background:#fff;color:#7fb5b2;border-color:#a9d3d1;cursor:not-allowed}
+  .go svg{width:18px;height:18px}
+  .err{min-height:1.3rem;margin:0;color:var(--red);font-size:.92rem;font-weight:600}
+  .shake{animation:shake .3s}
+  @keyframes shake{25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
+
+  footer{position:fixed;left:0;right:0;bottom:0;padding:.85rem 1rem;background:var(--maroon);color:#fff;
+         text-align:center;font-size:.85rem;font-weight:700}
+
+  @media (max-width:820px){
+    .card{grid-template-columns:1fr}
+    .form{order:1;padding:1.6rem 1.4rem 1.2rem}
+    .keys{order:2}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style></head>
+<body data-next="{{ next }}" data-pin-length="{{ pin_length|default:0 }}" data-image="{{ login_image|default:'https://images.unsplash.com/photo-1679731980192-a18d8bbb47d8?auto=format&amp;fit=max&amp;w=1600&amp;q=80' }}">
 {% csrf_token %}
-<div class="login-card wide">
-  <h1 class="h3 mb-3">Chokies Lounge</h1>
-  <div id="step1">
-    <p class="text-muted">Tap your name to sign in.</p>
-    <div class="tile-grid">
-      {% for u in staff %}<button class="tile" data-id="{{ u.id }}" data-name="{{ u.first_name|default:u.username }}">{{ u.first_name|default:u.username }}<small>{{ u.get_role_display }}</small></button>
-      {% empty %}<p class="text-danger">No staff have a PIN yet. Set one for each user in the admin.</p>{% endfor %}
-    </div>
+<main>
+  <div class="card">
+    <section class="keys" id="keys" aria-label="PIN numbers">
+      <button type="button" class="key" data-k="0">0</button>
+      <button type="button" class="key" data-k="1">1</button>
+      <button type="button" class="key" data-k="2">2</button>
+      <button type="button" class="key" data-k="3">3</button>
+      <button type="button" class="key" data-k="4">4</button>
+      <button type="button" class="key" data-k="5">5</button>
+      <button type="button" class="key" data-k="6">6</button>
+      <button type="button" class="key" data-k="7">7</button>
+      <button type="button" class="key" data-k="8">8</button>
+      <button type="button" class="key wide" data-k="9">9</button>
+      <button type="button" class="key wide aux" data-k="clear">Clear</button>
+    </section>
+
+    <section class="form">
+      <h1 class="logo" aria-label="{{ business_name|default:'Nova PoS' }}"><span class="a">{{ brand_first|default:"Nova" }}</span>{% if brand_rest %}<span class="b"> {{ brand_rest }}</span>{% endif %}</h1>
+      <div id="flash" class="flash hidden" role="status"></div>
+      <h2>Sign into your account</h2>
+      <input id="pin" type="password" readonly tabindex="-1" inputmode="none" autocomplete="off" placeholder="PIN number" aria-label="Your PIN, entered with the number keys">
+      <button id="go" type="button" class="go" disabled><span id="goText">Login</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/><path d="M15 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/></svg></button>
+      <p id="err" class="err" role="alert">{{ error }}</p>
+      <noscript><p class="err">JavaScript is needed to sign in.</p></noscript>
+    </section>
   </div>
-  <div id="step2" class="d-none">
-    <button id="back" class="btn btn-link p-0 mb-2">Not you? Go back</button>
-    <h2 class="h5">Enter PIN for <span id="who"></span></h2>
-    <div id="dots" class="dots" aria-live="polite"></div>
-    <div id="msg" class="text-danger small mb-2"></div>
-    <div class="pad">
-      {% for n in "123456789" %}<button class="btn btn-light" data-k="{{ n }}">{{ n }}</button>{% endfor %}
-      <button class="btn btn-outline-secondary" data-k="clear">Clear</button>
-      <button class="btn btn-light" data-k="0">0</button>
-      <button class="btn btn-outline-secondary" data-k="back">Delete</button>
-    </div>
-    <button id="go" class="btn btn-brand btn-lg w-100 mt-3" disabled>Sign in</button>
-  </div>
-</div>
+</main>
+
 <script>
-const $ = s => document.querySelector(s);
-let uid = null, pin = '';
-function draw() { $('#dots').textContent = pin ? '●'.repeat(pin.length) : '····'; $('#go').disabled = pin.length < 4; }
-function key(k) { $('#msg').textContent = ''; if (k === 'clear') pin = ''; else if (k === 'back') pin = pin.slice(0, -1); else if (pin.length < 6) pin += k; draw(); }
-document.querySelectorAll('.tile').forEach(b => b.onclick = () => { uid = b.dataset.id; $('#who').textContent = b.dataset.name; $('#step1').classList.add('d-none'); $('#step2').classList.remove('d-none'); pin = ''; draw(); });
-document.querySelectorAll('[data-k]').forEach(b => b.onclick = () => key(b.dataset.k));
-$('#back').onclick = () => { $('#step2').classList.add('d-none'); $('#step1').classList.remove('d-none'); pin = ''; };
-async function go() {
-  if (pin.length < 4) return;
-  const r = await fetch(location.pathname, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value },
-    body: JSON.stringify({ user_id: uid, pin, next: document.body.dataset.next }) });
-  const d = await r.json().catch(() => ({}));
-  if (r.ok) location.href = d.redirect; else { $('#msg').textContent = d.detail || 'Could not sign in.'; pin = ''; draw(); }
-}
-$('#go').onclick = go;
-document.addEventListener('keydown', e => { if ($('#step2').classList.contains('d-none')) return;
-  if (/^\d$/.test(e.key)) key(e.key); else if (e.key === 'Backspace') key('back'); else if (e.key === 'Enter') go(); });
-</script></body></html>
+(() => {
+  'use strict';
+  const $ = s => document.querySelector(s);
+  const body = document.body, field = $('#pin'), go = $('#go'), err = $('#err');
+  const LEN = parseInt(body.dataset.pinLength, 10) || 0;   // settings.POS_PIN_LENGTH: when set, signs in by itself at this length
+  const MIN = LEN || 4, MAX = LEN || 6;                    // PIN length limits (the server checks the PIN itself)
+  let pin = '', busy = false;
+
+  const csrf = () => document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+  const setErr = m => { err.textContent = m; };
+
+  /* photo behind the keys (settings.POS_LOGIN_IMAGE, else the Unsplash photo named in data-image above) */
+  if (body.dataset.image) $('#keys').style.backgroundImage = 'linear-gradient(#0000000f,#00000026),url(' + JSON.stringify(body.dataset.image) + ')';
+
+  /* message left by the POS (e.g. the cash count after "End shift") */
+  try {
+    const m = sessionStorage.getItem('login-flash');
+    if (m) { sessionStorage.removeItem('login-flash'); $('#flash').textContent = m; $('#flash').classList.remove('hidden'); }
+  } catch (e) { /* storage blocked: nothing to show */ }
+
+  /* The PIN is chosen only by selecting numbers (nothing is typed). */
+  const draw = () => { field.value = pin; go.disabled = busy || pin.length < MIN; };
+  function press(k) {
+    if (busy) return; setErr('');
+    if (k === 'clear') pin = ''; else if (pin.length < MAX) pin += k;
+    draw();
+    if (LEN && pin.length === LEN) signIn();      // no Login tap needed when every PIN has the same length
+  }
+  document.querySelectorAll('.key').forEach(b => b.onclick = () => press(b.dataset.k));
+  const lock = on => document.querySelectorAll('.key').forEach(b => b.disabled = on);
+  document.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.target.matches('button')) { e.preventDefault(); signIn(); } });
+
+  /* sign in: the server finds who owns the PIN, checks the shift and says where to go */
+  async function signIn() {
+    if (busy || pin.length < MIN) return;
+    busy = true; lock(true); setErr(''); draw(); $('#goText').textContent = 'Signing in\u2026';
+    try {
+      const r = await fetch(location.pathname, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-CSRFToken': csrf() },
+        body: JSON.stringify({ pin, next: body.dataset.next || '' }) });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.redirect) { $('#goText').textContent = 'Opening\u2026'; location.replace(d.redirect); return; }   // stay locked while the next page loads
+      setErr(d.detail || (r.status === 429 ? 'Too many wrong PINs. Try again in a few minutes.' : 'Could not sign in.'));
+    } catch (e) {
+      setErr('Could not reach the server. Check the connection and try again.');
+    }
+    busy = false; pin = ''; lock(false); $('#goText').textContent = 'Login'; draw();
+    field.classList.remove('shake'); void field.offsetWidth; field.classList.add('shake');
+  }
+  go.onclick = signIn;
+  draw();
+})();
+</script>
+</body></html>

@@ -7,7 +7,6 @@ urlpatterns = [
     path("auth/pin-login/", v.PinLoginView.as_view()),
     path("auth/logout/", v.LogoutView.as_view()),
     path("auth/me/", v.MeView.as_view()),
-    path("auth/roster/", v.RosterView.as_view()),
 
     # shifts: manager creates / manages
     path("shifts/", v.ShiftListCreateView.as_view()),
@@ -36,6 +35,17 @@ urlpatterns = [
     path("orders/<int:pk>/bill/", v.BillOrderView.as_view()),
     path("orders/<int:pk>/merge/", v.MergeOrdersView.as_view()),
     path("orders/<int:pk>/split/", v.SplitOrderView.as_view()),
+
+    # rooms: availability, bookings (billing and payment reuse bills/<id>/... below)
+    path("rooms/", v.RoomListView.as_view()),
+    path("rooms/guests/", v.GuestLookupView.as_view()),
+    path("rooms/<int:pk>/status/", v.RoomStatusView.as_view()),
+    path("bookings/", v.BookingListCreateView.as_view()),
+    path("bookings/<int:pk>/", v.BookingDetailView.as_view()),
+    path("bookings/<int:pk>/bill/", v.BookingBillView.as_view()),
+    path("bookings/<int:pk>/check-in/", v.BookingCheckInView.as_view()),
+    path("bookings/<int:pk>/check-out/", v.BookingCheckOutView.as_view()),
+    path("bookings/<int:pk>/cancel/", v.BookingCancelView.as_view()),
 
     # billing
     path("bills/", v.BillListView.as_view()),

@@ -26,7 +26,7 @@ def mk_user(username, role, pin="1234", **kw):
     return u
 
 
-@override_settings(ROOT_URLCONF="Chokies.tests",
+@override_settings(ROOT_URLCONF="Chokies.tests", POS_BUSINESS_NAME="Chokies Lounge",    # tests don't depend on the default name
                    PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"],   # fast tests
                    REST_FRAMEWORK={"EXCEPTION_HANDLER": "Chokies.api.handlers.exception_handler"})  # stale on purpose
 class FlowTests(TestCase):
@@ -86,10 +86,8 @@ class FlowTests(TestCase):
         r = w.post("/api/shifts/", {"staff": [{"user": self.off_duty.pk, "role": "WAITER"}]}, format="json")
         self.assertEqual(r.status_code, 403)
 
-    def test_roster_and_lockout(self):
+    def test_lockout(self):
         self.start_shift()
-        names = {x["username"] for x in APIClient().get("/api/auth/roster/").data}
-        self.assertEqual(names, {"wanjiku", "otieno", "chebet"})
         for _ in range(5):
             _, r = self.login("wanjiku", "0000")
             self.assertEqual(r.status_code, 401)
@@ -360,8 +358,11 @@ class FlowTests(TestCase):
         self.assertEqual(sorted((i["name"], i["quantity"]) for i in r.data["items"]), [("Pilau", 2), ("Tusker", 3)])
         self.assertEqual(r.data["totals"]["total"], "1900.00")          # 2 x 500 + 3 x 300
         self.assertEqual(Table.objects.get(pk=self.t1.pk).status, "OCCUPIED")
-        sent = w.post(f"/api/orders/{r.data['id']}/send/", {}, format="json")
-        self.assertEqual(sorted(k["station"] for k in sent.data["kots"]), ["BAR", "KITCHEN"])   # one ticket per selling point
+        # creating an order with items sends it at once, so the tickets come back with the new order
+        self.assertEqual(sorted(k["station"] for k in r.data["kots"]), ["BAR", "KITCHEN"])      # one ticket per selling point
+        self.assertEqual(w.get(f"/api/orders/{r.data['id']}/").data["status"], "SENT")
+        again = w.post(f"/api/orders/{r.data['id']}/send/", {}, format="json")
+        self.assertEqual(again.status_code, 409)                                                # nothing left to send
 
     def test_create_order_is_all_or_nothing(self):
         self.start_shift()
@@ -590,7 +591,8 @@ class PageViewTests(FlowTests):
         self.assertEqual(APIClient().post("/pin-login/", {"username": "wanjiku", "pin": "x"},
                                           format="json").status_code, 401)
         # the login PAGE (GET) - force the built-in form so a project template can't interfere
-        with mock.patch.object(views, "POS_LOGIN_TEMPLATE", "no-such-template.html"):
+        with mock.patch.object(views, "POS_LOGIN_TEMPLATE", "no-such-template.html"), \
+                self.assertLogs(views.log, level="WARNING"):
             g = APIClient().get("/pin-login/")
             self.assertEqual(g.status_code, 200)
             self.assertContains(g, 'name="pin"')
@@ -611,6 +613,27 @@ class PageViewTests(FlowTests):
         mgr, sid = self.mgr_and_shift()
         mgr.post(f"/api/shifts/{sid}/close/", {"counts": {str(self.cashier.pk): "1000"}}, format="json")
         self.assertEqual(c.get("/api/orders/").status_code, 401)
+
+    def test_pin_only_login_and_device_lockout(self):
+        """The login page sends just the PIN: the server finds the person, and wrong guesses are counted per device."""
+        from django.core.cache import cache
+        cache.clear()                                   # the lockout counters live in the cache
+        self.addCleanup(cache.clear)
+        self.start_shift()
+        c = APIClient()
+        r = c.post("/pin-login/", {"pin": "1111"}, format="json")             # no username at all
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual((r.json()["role"], r.json()["user"]["username"]), ("waiter", "wanjiku"))
+        self.assertEqual(c.get("/api/orders/").status_code, 200)              # session cookie works
+        r = APIClient().post("/pin-login/", {"pin": "9999"}, format="json")   # managers need no shift
+        self.assertEqual((r.status_code, r.json()["role"]), (200, "manager"))
+        self.assertEqual(APIClient().post("/pin-login/", {"pin": "4444"}, format="json").status_code, 403)   # off the roster
+        # wrong PINs (and junk) are counted against the device; after the limit even the right PIN is refused
+        for i in range(views.PIN_LOGIN_MAX_FAILS):
+            bad = APIClient().post("/pin-login/", {"pin": "0000" if i % 2 else "x"}, format="json")
+            self.assertEqual(bad.status_code, 401, i)
+        for pin in ("0000", "1111"):
+            self.assertEqual(APIClient().post("/pin-login/", {"pin": pin}, format="json").status_code, 429)
 
     def mgr_and_shift(self):
         mgr, _ = self.login("mary", "9999")
@@ -650,3 +673,154 @@ class RenumberBarOrdersTests(TestCase):
         call_command("renumber_bar_orders", "--apply", stdout=out)               # second run: nothing left
         self.assertIn("Nothing to do", out.getvalue())
         self.assertEqual(views.next_order_number(), "ORD-000006")                # new orders carry on after
+
+# =============================================================================
+# Rooms: booking, billing, payment, check-in / check-out
+# =============================================================================
+from datetime import timedelta                      # noqa: E402
+from django.utils import timezone                   # noqa: E402
+from .models import Bill, Room, RoomBooking         # noqa: E402
+
+
+@override_settings(ROOT_URLCONF="Chokies.tests", PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
+class RoomTests(TestCase):
+    login, start_shift = FlowTests.login, FlowTests.start_shift   # same helpers, without re-running FlowTests' own tests
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.manager = mk_user("mary", User.Role.MANAGER, "9999")
+        cls.waiter = mk_user("wanjiku", User.Role.WAITER, "1111")
+        cls.waiter2 = mk_user("otieno", User.Role.WAITER, "2222")
+        cls.cashier = mk_user("chebet", User.Role.CASHIER, "3333")
+        cls.off_duty = mk_user("kamau", User.Role.WAITER, "4444")
+        cls.deluxe = Room.objects.create(name="DELUXE 001", room_type="Executive", rate_bo=3000, rate_bnb=5000, rate_hb=7000, rate_fb=9000)
+        cls.std = Room.objects.create(name="Std Room 001", room_type="Studio", rate_bo=2000, rate_bnb=4000)
+        cls.broken = Room.objects.create(name="Std Room 002", rate_bo=2000, status=Room.Status.MAINTENANCE)
+        cls.today = timezone.localdate()
+
+    def body(self, rooms=None, nights=2, start=0, **kw):
+        d = {"guest_name": "Jane Mwangi", "phone": "0712345678", "occupants": 2, "narrative": "Acme Ltd",
+             "check_in": str(self.today + timedelta(days=start)), "check_out": str(self.today + timedelta(days=start + nights)),
+             "rooms": rooms or [{"room": self.deluxe.pk, "meal_plan": "BNB"}, {"room": self.std.pk, "meal_plan": "BO"}]}
+        d.update(kw)
+        return d
+
+    def test_full_stay_book_part_pay_settle_check_in_out(self):
+        self.start_shift()
+        w, _ = self.login("wanjiku", "1111")
+        r = w.post("/api/bookings/", self.body(payment={"method": "CASH", "amount": "5000.00", "tendered": "6000.00",
+                                                          "idempotency_key": "k1"}), format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+        t, b = r.data["totals"], r.data["booking"]
+        # (5000 + 2000) x 2 nights = 14000 net; VAT 16% = 2240; catering levy 2% = 280
+        self.assertEqual((t["subtotal"], t["tax"], t["levy"], t["total"]), ("14000.00", "2240.00", "280.00", "16520.00"))
+        self.assertEqual((t["paid"], t["balance"], b["pay_state"], b["status"]), ("5000.00", "11520.00", "PART", "RESERVED"))
+        self.assertEqual(b["number"], "BK-000001")
+        self.assertEqual(b["rooms"], ["DELUXE 001", "Std Room 001"])
+        # checking in works (today); checking out does not while money is owed
+        self.assertEqual(w.post(f"/api/bookings/{b['id']}/check-in/").data["booking"]["status"], "CHECKED_IN")
+        r = w.post(f"/api/bookings/{b['id']}/check-out/")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("Settle the bill", r.data["detail"])
+        # the cashier collects the balance through the normal bill payment API
+        c, _ = self.login("chebet", "3333")
+        paid = c.post(f"/api/bills/{b['bill_id']}/pay/", {"method": "CASH", "amount": "11520.00", "tendered": "12000"}, format="json")
+        self.assertEqual((paid.status_code, paid.data["status"], paid.data["booking_number"]), (201, "PAID", "BK-000001"))
+        # the receipt, and the cashier's paid list, know about room bills
+        rc = c.get(f"/api/bills/{b['bill_id']}/receipt/")
+        self.assertContains(rc, "BK-000001")
+        self.assertContains(rc, "Catering levy")
+        self.assertContains(rc, "DELUXE 001")
+        rows = c.get("/api/bills/").data
+        self.assertEqual([(x["source"], x["booking"], x["order"]) for x in rows], [("ROOM", b["id"], None)])
+        self.assertEqual(w.get("/api/shift/sales/").data["summary"]["count"], 1)    # shows in the waiter's My sales
+        me = w.get("/api/auth/me/").data
+        self.assertEqual((me["room_vat_percent"], me["room_levy_percent"]), (16.0, 2.0))
+        retry = w.post("/api/bookings/", self.body(payment={"method": "CASH", "amount": "1.00", "idempotency_key": "k1"}), format="json")
+        self.assertEqual(retry.status_code, 409)                                      # same key again: not booked twice
+        self.assertEqual(RoomBooking.objects.count(), 1)
+        # check-out frees the booking and sends the rooms to housekeeping
+        out = w.post(f"/api/bookings/{b['id']}/check-out/")
+        self.assertEqual(out.data["booking"]["status"], "CHECKED_OUT")
+        self.assertEqual(set(Room.objects.filter(pk__in=[self.deluxe.pk, self.std.pk]).values_list("status", flat=True)), {"CLEANING"})
+        rooms = {x["name"]: x for x in w.get("/api/rooms/").data["rooms"]}
+        self.assertFalse(rooms["DELUXE 001"]["booked"])
+        self.assertEqual(rooms["DELUXE 001"]["note"], "The room is still under cleaning.")
+        self.assertEqual(w.post(f"/api/rooms/{self.deluxe.pk}/status/", {"status": "AVAILABLE"}, format="json").data["status"], "AVAILABLE")
+
+    def test_a_room_cannot_be_double_booked_but_back_to_back_stays_are_fine(self):
+        self.start_shift()
+        w, _ = self.login("wanjiku", "1111")
+        one = [{"room": self.deluxe.pk, "meal_plan": "BO"}]
+        self.assertEqual(w.post("/api/bookings/", self.body(one, nights=3), format="json").status_code, 201)
+        r = w.post("/api/bookings/", self.body(one, nights=1, start=2), format="json")      # night 3 is taken
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("already booked", r.data["detail"])
+        self.assertEqual(w.post("/api/bookings/", self.body(one, nights=2, start=3), format="json").status_code, 201)   # leaves the day the other arrives
+        avail = {x["name"]: x for x in w.get(f"/api/rooms/?from={self.today}&to={self.today + timedelta(days=1)}").data["rooms"]}
+        self.assertTrue(avail["DELUXE 001"]["booked"])
+        self.assertFalse(avail["Std Room 001"]["booked"])
+
+    def test_booking_rules(self):
+        self.start_shift()
+        w, _ = self.login("wanjiku", "1111")
+        yesterday = w.post("/api/bookings/", self.body(start=-1), format="json")
+        self.assertEqual((yesterday.status_code, yesterday.data["detail"]), (409, "Check-in cannot be in the past"))
+        out = w.post("/api/bookings/", self.body([{"room": self.broken.pk, "meal_plan": "BO"}]), format="json")
+        self.assertEqual((out.status_code, out.data["detail"]), (409, "Std Room 002 is out of service"))
+        plan = w.post("/api/bookings/", self.body([{"room": self.std.pk, "meal_plan": "FB"}]), format="json")
+        self.assertIn("not offered", plan.data["detail"])
+        self.assertEqual(w.post("/api/bookings/", self.body(nights=0), format="json").status_code, 409)
+        no_rooms = self.body(); no_rooms["rooms"] = []
+        self.assertEqual(w.post("/api/bookings/", no_rooms, format="json").status_code, 400)
+        # paying more than the bill fails AND leaves no booking behind
+        r = w.post("/api/bookings/", self.body(payment={"method": "CASH", "amount": "999999"}), format="json")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(RoomBooking.objects.count(), 0)
+        # an M-Pesa payment needs its code
+        r = w.post("/api/bookings/", self.body(payment={"method": "MOBILE_MONEY", "amount": "1000"}), format="json")
+        self.assertIn("reference", r.data["detail"])
+        # early check-in is refused
+        ok = w.post("/api/bookings/", self.body(start=2), format="json")
+        self.assertEqual(w.post(f"/api/bookings/{ok.data['booking']['id']}/check-in/").status_code, 409)
+
+    def test_waiters_only_touch_their_own_bookings_and_staff_need_a_shift(self):
+        self.assertEqual(self.login("kamau", "4444")[1].status_code, 403)
+        self.start_shift()
+        w, _ = self.login("wanjiku", "1111")
+        w2, _ = self.login("otieno", "2222")
+        b = w.post("/api/bookings/", self.body(), format="json").data["booking"]
+        self.assertEqual(w2.get("/api/bookings/").data, [])
+        self.assertEqual(w2.get(f"/api/bookings/{b['id']}/").status_code, 403)
+        self.assertEqual(w2.post(f"/api/bookings/{b['id']}/bill/").status_code, 403)
+        self.assertEqual(len(w.get("/api/bookings/").data), 1)
+        c, _ = self.login("chebet", "3333")                       # cashiers see and bill every booking
+        self.assertEqual(len(c.get("/api/bookings/").data), 1)
+        self.assertEqual(c.post(f"/api/bookings/{b['id']}/bill/").status_code, 201)
+
+    def test_cancelling_needs_the_bill_dealt_with_first(self):
+        self.start_shift()
+        w, _ = self.login("wanjiku", "1111")
+        b = w.post("/api/bookings/", self.body(), format="json").data["booking"]
+        bill = w.post(f"/api/bookings/{b['id']}/bill/").data["bill"]
+        self.assertEqual(w.post(f"/api/bookings/{b['id']}/bill/").status_code, 409)             # one bill per booking
+        r = w.post(f"/api/bookings/{b['id']}/cancel/", {"reason": "Guest changed plans"}, format="json")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn(f"Cancel bill {bill['number']}", r.data["detail"])
+        m, _ = self.login("mary", "9999")                         # a manager cancels the unpaid bill
+        self.assertEqual(m.post(f"/api/bills/{bill['id']}/cancel/", {"reason": "Wrong dates"}, format="json").status_code, 200)
+        self.assertEqual(w.post(f"/api/bookings/{b['id']}/cancel/", {}, format="json").status_code, 409)   # reason needed
+        done = w.post(f"/api/bookings/{b['id']}/cancel/", {"reason": "Guest changed plans"}, format="json")
+        self.assertEqual(done.data["booking"]["status"], "CANCELLED")
+        self.assertEqual(w.post("/api/bookings/", self.body(), format="json").status_code, 201)  # rooms are free again
+
+    def test_guest_lookup_and_day_close_blocker(self):
+        self.start_shift()
+        w, _ = self.login("wanjiku", "1111")
+        b = w.post("/api/bookings/", self.body(), format="json").data["booking"]
+        found = w.get("/api/rooms/guests/?q=jane").data
+        self.assertEqual([(g["guest_name"], g["phone"]) for g in found], [("Jane Mwangi", "0712345678")])
+        self.assertEqual(w.get("/api/rooms/guests/?q=j").data, [])                    # too short to search
+        w.post(f"/api/bookings/{b['id']}/bill/")
+        m, _ = self.login("mary", "9999")
+        self.assertTrue(any("room bill" in x for x in m.get("/api/reports/z/preview/").data["blockers"]))

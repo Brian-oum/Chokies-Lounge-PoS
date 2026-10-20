@@ -21,6 +21,7 @@ h1,h2,h3,p{margin:0}
 
 /* utilities */
 .hidden{display:none!important}.grow{flex:1}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .muted,small{color:var(--mut)}small{display:block;font-size:.78rem}
 .num{text-align:right;font-variant-numeric:tabular-nums}.strong{font-weight:700}
 
@@ -72,7 +73,6 @@ dialog:is(.odlg,.ddlg)[open]{display:flex;flex-direction:column}
 /* components.css — reusable pieces: chips, pills, segmented controls, cards, tables, stats */
 .brand{display:flex;align-items:center;gap:.6rem}
 .logo{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#ffffff;font-weight:800}
-.brand.big .logo{width:46px;height:46px;font-size:1.3rem}.brand.big small{margin-top:2px}
 .avatar{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:var(--card);border:1px solid var(--line);font-weight:700;color:var(--brand)}
 .chip{padding:.25rem .7rem;border-radius:99px;background:#14532d1f;color:var(--brand);font-size:.82rem;font-weight:600}
 .chip.money{background:#16a34a1f;color:var(--ok)}
@@ -209,7 +209,7 @@ button.stat{cursor:pointer;transition:var(--ease)}button.stat:hover{border-color
 /* ======================================================================== */
 /* SCREENS */
 /* ======================================================================== */
-/* screens.css — page structure: top bar + nav, login, layouts, waiter home, dialogs, responsive rules */
+/* screens.css — page structure: top bar + nav, layouts, waiter home, dialogs, responsive rules */
 
 /* ---------- top bar + main navigation ---------- */
 .top{display:flex;align-items:center;gap:.9rem;padding:.65rem 1.1rem;background:rgba(255,255,255,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
@@ -233,19 +233,6 @@ button.stat{cursor:pointer;transition:var(--ease)}button.stat:hover{border-color
 .navbar .badge{background:var(--warn);color:#fff;font-weight:800}
 .notice{margin:.7rem 1.1rem 0;padding:.7rem 1rem;border-radius:12px;background:#b453091f;color:var(--warn)}
 
-/* ---------- login ---------- */
-.login{position:fixed;inset:0;z-index:40;display:grid;place-items:center;background:radial-gradient(900px 500px at 50% 0,#e0eee5,var(--bg))}
-.login-card{width:min(94vw,400px);display:grid;gap:.8rem;background:var(--bg);border:1px solid var(--line);border-radius:24px;padding:1.6rem;box-shadow:0 30px 80px #0000004d}
-.login input{padding:.8rem;border-radius:12px;border:1px solid var(--line);background:var(--bg);text-align:center}
-.roster{display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center}
-.roster button{border:1px solid var(--line);background:var(--card);border-radius:14px;padding:.55rem .8rem;cursor:pointer;min-width:92px}
-.roster button.on{border-color:var(--brand)}.roster small{margin:0}
-.dots{text-align:center;font-size:1.9rem;letter-spacing:.5rem;min-height:2.4rem;color:var(--brand)}
-.err{color:var(--bad);text-align:center;min-height:1.2rem;font-size:.9rem}
-.hint{color:var(--mut);font-size:.78rem;text-align:center}
-.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem}
-.pad button{padding:1rem;font-size:1.3rem;border-radius:14px;border:1px solid var(--line);background:var(--card);cursor:pointer}
-.pad button:active{background:var(--brand);color:#fff}
 
 /* ---------- main layout (columns depend on the signed-in role) ---------- */
 .layout{flex:1;min-height:0;display:grid;gap:1rem;padding:1rem 1.1rem}
@@ -358,7 +345,7 @@ dialog.paydlg{width:min(96vw,520px);max-height:94dvh;overflow:auto}
 body:is([data-page=orders],[data-page=paid],[data-page=order]) :is(#home,#openPanel,.layout>.c-only,.layout>#ticket){display:none!important}   /* a table page / the order page replaces the home / desk */
 body[data-page=order] #ordersPage{display:none!important}
 .layout>#ticket{display:none!important}   /* orders open on the order page; the inline ticket is no longer shown */
-body:not([data-page=orders]):not([data-page=paid]) .opage{display:none!important}
+body:not([data-page=orders]):not([data-page=paid]):not([data-page=bookings]) .opage{display:none!important}
 body:not([data-page=order]) .ipage{display:none!important}
 body:is([data-page=orders],[data-page=paid],[data-page=order]) .layout{grid-template-columns:minmax(0,1fr)!important;grid-template-rows:minmax(0,1fr)}
 .opage{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:1rem;padding:.2rem .3rem 1.2rem}
@@ -440,11 +427,11 @@ body:is([data-page=orders],[data-page=paid],[data-page=order]) .layout{grid-temp
 /* Print (A4): only the invoice */
 @media print{
   html,body{height:auto!important;background:#fff!important}
-  body[data-page=order] :is(.top,.navbar,#notice,.ibar,#toasts){display:none!important}
-  body[data-page=order] .layout{display:block!important;padding:0!important;overflow:visible!important}
-  body[data-page=order] .ipage{overflow:visible!important;padding:0!important}
-  body[data-page=order] .inv{border:0!important;box-shadow:none!important;padding:0!important}
-  body[data-page=order] .inv-pay{box-shadow:none!important}
+  body:is([data-page=order],[data-page=booking]) :is(.top,.navbar,#notice,.ibar,#toasts){display:none!important}
+  body:is([data-page=order],[data-page=booking]) .layout{display:block!important;padding:0!important;overflow:visible!important}
+  body:is([data-page=order],[data-page=booking]) :is(.ipage,.kpage){overflow:visible!important;padding:0!important}
+  body:is([data-page=order],[data-page=booking]) .inv{border:0!important;box-shadow:none!important;padding:0!important}
+  body:is([data-page=order],[data-page=booking]) .inv-pay{box-shadow:none!important}
   .inv-items th,.inv-totals th,.inv-totals td,.inv-pay th{-webkit-print-color-adjust:exact;print-color-adjust:exact}
   @page{size:A4;margin:12mm}
 }
@@ -475,3 +462,74 @@ body:is([data-page=orders],[data-page=paid],[data-page=order]) .layout{grid-temp
   .ometa,.otot{grid-template-columns:1fr}.obody{padding:.8rem}.ohead{padding:.7rem .8rem}
 }
 @media(max-width:1000px){.col.orders,.col.drawer{border:0;padding:0}}
+/* ======================================================================== */
+/* ROOMS: Book room, booking page, online bookings */
+/* ======================================================================== */
+/* these pages replace the home / desk, exactly like the table pages and the order page do */
+body:is([data-page=book],[data-page=booking],[data-page=online],[data-page=bookings]) :is(#home,#openPanel,.layout>.c-only,.layout>#ticket){display:none!important}
+body:is([data-page=book],[data-page=booking],[data-page=online],[data-page=bookings]) .layout{grid-template-columns:minmax(0,1fr)!important;grid-template-rows:minmax(0,1fr)}
+body:not([data-page=book]) .bpage,body:not([data-page=booking]) .kpage,body:not([data-page=online]) .onpage{display:none!important}
+body[data-page=bookings] label:has(#fSp){display:none}   /* bookings have no selling point */
+
+/* status pills */
+.pill.RESERVED,.pill.NEW{background:#2563eb24;color:var(--blue)}
+.pill.CHECKED_IN,.pill.CONFIRMED,.pill.P-PAID{background:#16a34a24;color:var(--ok)}
+.pill.CHECKED_OUT,.pill.P-REFUNDED{background:#5b6b6224;color:var(--mut)}
+.pill.CANCELLED{background:#dc262620;color:var(--bad)}
+.pill.P-UNBILLED,.pill.P-UNPAID,.pill.AWAITING_PAYMENT{background:#b4530924;color:var(--warn)}
+.pill.P-PART{background:#7c3aed24;color:var(--vio)}
+
+/* ---------- Book room ---------- */
+.bpage{min-height:0;overflow:auto;display:grid;grid-template-columns:minmax(340px,470px) minmax(0,1fr);gap:1rem;align-items:start;padding:.2rem .3rem 1.2rem}
+.rfinder{display:grid;gap:.9rem;padding:1.1rem 1.2rem;align-content:start}
+.rfinder>select,.bform :is(input,select,textarea){padding:.6rem .7rem;border:1px solid var(--line2);border-radius:var(--r-sm);background:var(--bg);width:100%}
+.rfinder>select:focus,.bform :is(input,select,textarea):focus{outline:2px solid var(--brand2);border-color:transparent}
+.rf-dates{display:flex;gap:.7rem;align-items:flex-end}
+.rf-dates label{display:grid;gap:.3rem;flex:1;min-width:0;font-weight:700;font-size:.9rem}.rf-dates input{padding:.5rem .6rem;border:1px solid var(--line2);border-radius:var(--r-sm);background:var(--bg);min-width:0}
+.req{color:var(--bad)}
+.rf-count{font-weight:800;padding-top:.7rem;border-top:1px solid var(--line)}
+.rtable{width:100%;border-collapse:collapse;font-size:.9rem}
+.rtable th{text-align:left;padding:.5rem .3rem;border-bottom:2px solid var(--line2);font-size:.88rem}.rtable th.num{text-align:right}
+.rtable td{padding:.7rem .3rem;border-bottom:1px solid var(--line);vertical-align:top}
+.rtable td.empty{text-align:center;color:var(--mut);padding:1.4rem}
+.rtable .rname{font-weight:600;white-space:nowrap}.rtable th small.inl{display:inline;font-weight:400}.rtable .rtype{margin-left:.25rem;font-size:.75rem;color:#be185d}
+.rtable small{margin-top:.15rem}.rnote{color:var(--blue);font-style:italic}.rnote .linkbtn{display:inline;font-style:normal;padding:0 .2rem;font-size:inherit;white-space:nowrap}
+.rates{display:flex;flex-wrap:wrap;gap:.1rem .7rem;min-width:130px}.rates span{white-space:nowrap}
+.bknow{display:inline-flex;align-items:center;gap:.3rem;text-align:left}.bknow svg{width:15px;height:15px;fill:currentColor}
+.rtable td.num{white-space:nowrap}
+
+.bform{display:flex;flex-direction:column}
+.bk-clock{color:var(--bad);font-variant-numeric:tabular-nums;font-weight:600}
+.bf-body{display:grid;gap:1.1rem;padding:1rem 1.3rem 1.3rem}
+.bf-find{display:flex;justify-content:flex-end}
+.bf-grid{display:grid;grid-template-columns:.7fr 1.3fr 1.2fr 1.4fr;gap:.9rem 1.1rem}
+.bf-grid label,.bf-sum label,.bf-pay label{display:grid;gap:.3rem;font-weight:700;font-size:.9rem;align-content:start}
+.bf-grid em,.bf-pay em{font-weight:400;font-style:normal;color:var(--mut);font-size:.78rem}
+.bf-grid .wide{grid-column:1/-1}.bf-grid textarea{resize:vertical}
+.bform input[readonly]{background:var(--raise);color:var(--mut)}
+.blines{width:100%;border-collapse:collapse;font-size:.92rem}
+.blines th{background:var(--brand);color:#fff;text-align:left;padding:.6rem .7rem;white-space:nowrap}.blines th.num{text-align:right}
+.blines td{padding:.55rem .7rem;border-bottom:1px solid var(--line);vertical-align:middle}.blines td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.blines td.empty{text-align:center;color:var(--mut);padding:1.5rem}.blines td small{margin:0}.blines .bplan{min-width:150px}
+.bf-sum{display:grid;grid-template-columns:1fr 1fr 1.6fr;gap:.9rem;border-top:1px solid var(--line);padding-top:1rem}
+.bf-pay{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.9rem 1.1rem}
+.bform output{display:block;padding:.6rem .7rem;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--raise);font-weight:600;font-variant-numeric:tabular-nums}
+.bform output.big{border-color:var(--brand2);color:var(--brand);font-size:1.2rem;font-weight:800}
+.bf-pay .due-l{color:var(--bad)}.bf-pay .due-l output{color:var(--bad)}
+.bf-foot{display:grid;gap:.6rem;max-width:460px;margin-left:auto;width:100%}.bf-foot .btn{padding:.85rem 1rem;font-size:1rem}
+
+/* find customer dialog */
+.glist{display:grid;margin:.8rem 0;max-height:46vh;overflow:auto}.gnote{padding:.8rem .2rem}
+.gitem{display:grid;gap:.1rem;text-align:left;padding:.7rem .8rem;border:0;border-bottom:1px solid var(--line);background:transparent;cursor:pointer;border-radius:10px}
+.gitem:hover,.gitem:focus-visible{background:var(--panel)}.gitem small{margin:0}
+
+/* ---------- booking page + online bookings ---------- */
+.kpage,.onpage{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:.9rem;padding:.2rem .3rem 1.4rem}
+.kpage .alert{flex:1 1 100%}
+.onnote{padding:.8rem 1.3rem 0}.onpage .tablecard{flex:none}.onpage .dstats{padding:1rem 1.3rem .2rem}
+.otable td .btn[disabled]{opacity:.45}
+.otable td.empty{text-align:center}
+
+@media(max-width:1100px){.bf-grid{grid-template-columns:1fr 1fr}.bf-pay{grid-template-columns:1fr 1fr}}
+@media(max-width:1000px){.bpage{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:560px){.bf-grid,.bf-pay,.bf-sum{grid-template-columns:1fr}.rf-dates{flex-wrap:wrap}.bf-body{padding:.9rem}}

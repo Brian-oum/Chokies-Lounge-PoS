@@ -8,11 +8,12 @@ Nothing here needs a migration. A *direct purchase* is a purchase order numbered
 and received in one step, so it flows through the same ledger, average cost and goods-receipt records as an
 LPO (a Local Purchase Order is a PurchaseOrder numbered PO-xxxxxx).
 
-Sections: access - helpers - services - dashboard - purchases - LPOs - receive - items - balances -
+Sections: access - helpers - services - dashboard (+ rooms) - purchases - LPOs - receive - items - balances -
           stock takes - issue - recipes - voids - discounts
 """
 import csv
-from datetime import timedelta
+from collections import defaultdict
+from datetime import datetime, time, timedelta
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -22,21 +23,23 @@ from django.contrib import messages
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.paginator import Paginator
 from django.db import transaction
-from django.db.models import DecimalField, ExpressionWrapper, F, Q, Sum, Value
-from django.db.models.functions import Coalesce
-from django.http import HttpResponse
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum, Value
+from django.db.models.functions import Coalesce, ExtractHour, TruncDate
+from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
+from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_POST
 
 from .models import (AuditLog, Bill, Category, DocumentSequence, DomainError, GoodsReceipt, GoodsReceiptLine, InvalidState,
-                     Location, MenuItem, MovementType, Order, OrderItem, PurchaseOrder, PurchaseOrderLine, RecipeLine,
-                     Station, StockBalance, StockItem, StockMovement, StockTake, StockTakeLine, Supplier, audit)
-from .views import (POS_HOME_URL, D, _num, _require_manager, approve_stock_take, cancel_bill, compute_bill_amounts,
-                    create_purchase_order, q, receive_goods, record_count, record_movement, send_purchase_order,
-                    start_stock_take, void_item)
+                     Location, MenuItem, MovementType, Order, OrderItem, Payment, PurchaseOrder, PurchaseOrderLine,
+                     RecipeLine, Room, RoomBooking, Shift, ShiftAssignment, Station, StockBalance, StockItem,
+                     StockMovement, StockTake, StockTakeLine, Supplier, Table, audit)
+from .views import (POS_HOME_URL, D, _num, _require_manager, approve_stock_take, booking_data, cancel_bill,
+                    check_in_booking, check_out_booking, compute_bill_amounts, create_purchase_order, q, receive_goods,
+                    record_count, record_movement, send_purchase_order, set_room_status, start_stock_take, void_item)
 
 LOGIN_URL = getattr(settings, "POS_LOGIN_URL", "/pin-login/")
 DIRECT_PREFIX = "DP-"          # purchase orders created by "New purchase" (no LPO)
@@ -407,30 +410,396 @@ def remove_bill_discount(*, bill, user, reason):
 
 
 # =============================================================================
-# Dashboard
+# Dashboard (Overview): KPIs, charts, insights, live operations and rooms
 # =============================================================================
+# One builder (_dashboard_payload) feeds both the first paint (json_script in dashboard.html) and the live
+# refresh (dashboard_data, polled by manager.js every 30 s). Amounts are floats here: they are for display only.
+# Optional setting: POS_CURRENCY (default "KSh").
+
+CURRENCY = getattr(settings, "POS_CURRENCY", "KSh")
+TREND_DAYS = 14                 # days in the sales chart (also the baseline for "typical" hours and voids)
+STALE_BILL_HOURS = 2            # an unpaid bill older than this is flagged
+ROOM_HORIZON = 7                # nights in the room forecast
+RB = RoomBooking.Status
+
+
+def _f(x):
+    return float(q(x or 0))
+
+
+def _midnight(day):
+    return timezone.make_aware(datetime.combine(day, time.min))
+
+
+def _paid(start, end):
+    return Bill.objects.filter(status=Bill.Status.PAID, paid_at__gte=start, paid_at__lt=end)
+
+
+def _sales(start, end):
+    a = _paid(start, end).aggregate(t=Sum("total"), n=Count("id"))
+    return a["t"] or D(0), a["n"] or 0
+
+
+def _change(now_value, before):
+    """Percent change, or None when there is nothing to compare with."""
+    return round(float((now_value - before) / before * 100), 1) if before else None
+
+
+def _hours(start, end):
+    """Paid sales per clock hour (index 0-23) between two moments."""
+    out = [0.0] * 24
+    rows = _paid(start, end).annotate(h=ExtractHour("paid_at")).values("h").annotate(t=Sum("total")).order_by()
+    for r in rows:
+        out[r["h"]] = _f(r["t"])
+    return out
+
+
+def _trend(today):
+    first = today - timedelta(days=TREND_DAYS - 1)
+    rows = (_paid(_midnight(first), _midnight(today + timedelta(days=1))).annotate(d=TruncDate("paid_at")).values("d")
+            .annotate(food=Sum("total", filter=Q(booking__isnull=True)), rooms=Sum("total", filter=Q(booking__isnull=False)),
+                      n=Count("id")).order_by())
+    by_day = {r["d"]: r for r in rows}
+    out = []
+    for i in range(TREND_DAYS):
+        d = first + timedelta(days=i)
+        r = by_day.get(d, {})
+        food, rooms = _f(r.get("food")), _f(r.get("rooms"))
+        out.append({"date": d.isoformat(), "food": food, "rooms": rooms, "total": round(food + rooms, 2), "bills": r.get("n", 0)})
+    return out
+
+
+def _methods(start, end):
+    """Money collected today by payment method (refunds are negative, so this is net)."""
+    labels = dict(Payment.Method.choices)
+    rows = (Payment.objects.filter(created_at__gte=start, created_at__lt=end).values("method")
+            .annotate(t=Sum("amount")).order_by("-t"))
+    return [{"key": r["method"], "label": labels.get(r["method"], str(r["method"]).replace("_", " ").title()),
+             "amount": _f(r["t"])} for r in rows if r["t"] and r["t"] > 0]
+
+
+def _sellers(start, end):
+    """Best sellers and category mix from the lines saved on paid bills. Rooms are left out: they have their own section."""
+    items, cats = {}, defaultdict(lambda: D(0))
+    for lines in _paid(start, end).values_list("lines", flat=True):
+        for ln in lines or []:
+            if ln.get("category") == "Accommodation":
+                continue
+            amount, qty = D(str(ln.get("line_total") or 0)), D(str(ln.get("quantity") or 0))
+            row = items.setdefault(ln.get("name") or "Item", [D(0), D(0)])
+            row[0] += qty
+            row[1] += amount
+            cats[ln.get("category") or "Other"] += amount
+    total = sum(cats.values(), D(0))
+    top = sorted(items.items(), key=lambda kv: kv[1][1], reverse=True)[:6]
+    top_cats = sorted(cats.items(), key=lambda kv: kv[1], reverse=True)[:6]
+    return {"items": [{"name": n, "qty": _f(v[0]), "amount": _f(v[1])} for n, v in top],
+            "cats": [{"name": n, "amount": _f(a), "share": round(float(a / total * 100), 1) if total else 0} for n, a in top_cats]}
+
+
+def _hour_label(h):
+    def one(x):
+        x %= 24
+        return f"{x % 12 or 12} {'am' if x < 12 else 'pm'}"
+    return f"{one(h)} to {one(h + 1)}"
+
+
+def _money_text(x):
+    return f"{CURRENCY} {float(x):,.0f}"
+
+
+def _rooms_block(today):
+    """Room board, today's arrivals / departures and the next seven nights, from the same services the POS uses."""
+    rooms = list(Room.objects.filter(is_active=True).order_by("name"))
+    horizon = today + timedelta(days=ROOM_HORIZON)
+    bookings = list(RoomBooking.objects.filter(status__in=[RB.RESERVED, RB.CHECKED_IN], check_in__lte=horizon)
+                    .select_related("booked_by").prefetch_related("lines__room", "bills").order_by("check_in", "id"))
+
+    in_house, arrivals, late, upcoming, departures = [], [], [], [], []
+    occupied_by, arriving_for, next_in = {}, {}, {}
+    for b in bookings:
+        d = booking_data(b)
+        lines = list(b.lines.all())
+        not_ready = [l.room.name for l in lines if l.room.status != Room.Status.AVAILABLE]
+        action = None
+        if b.status == RB.CHECKED_IN:
+            action = "check-out"
+        elif b.check_in <= today:
+            action = "check-in"
+        row = {"id": b.pk, "number": b.number, "guest": b.guest_name, "phone": b.phone, "rooms": d["rooms"],
+               "guests": b.occupants, "check_in": b.check_in.isoformat(), "check_out": b.check_out.isoformat(),
+               "nights": b.nights, "pay": d["pay_state"], "total": _f(d["total"]), "balance": _f(d["balance"]),
+               "action": action, "not_ready": not_ready,
+               "url": reverse("manager:booking_action", args=[b.pk, action]) if action else ""}
+        room_ids = [l.room_id for l in lines]
+        if b.status == RB.CHECKED_IN:
+            in_house.append(row)
+            for rid in room_ids:
+                occupied_by[rid] = row
+            if b.check_out <= today:
+                departures.append(dict(row, overdue=b.check_out < today))
+        else:
+            if b.check_in < today:
+                late.append(row)
+            elif b.check_in == today:
+                arrivals.append(row)
+            else:
+                upcoming.append(row)
+            for rid in room_ids:
+                if b.check_in <= today:
+                    arriving_for[rid] = row
+                else:
+                    next_in.setdefault(rid, b.check_in.isoformat())
+
+    tiles = []
+    for r in rooms:
+        occ, arr = occupied_by.get(r.pk), arriving_for.get(r.pk)
+        if occ:
+            state = "occupied"
+        elif r.status == Room.Status.MAINTENANCE:
+            state = "maintenance"
+        elif arr:
+            state = "arriving"
+        elif r.status == Room.Status.CLEANING:
+            state = "cleaning"
+        else:
+            state = "vacant"
+        who = occ or arr
+        kind = r.get_room_type_display() if hasattr(r, "get_room_type_display") else str(r.room_type)
+        tiles.append({"id": r.pk, "name": r.name, "type": kind, "capacity": r.capacity, "status": r.status, "state": state,
+                      "guest": who["guest"] if who else "", "until": occ["check_out"] if occ else "",
+                      "due_out": bool(occ and occ["check_out"] <= today.isoformat()),
+                      "from": arr["check_in"] if arr else "", "next": next_in.get(r.pk, "") if not who else "",
+                      "url": reverse("manager:room_status", args=[r.pk])})
+
+    forecast = []
+    for i in range(ROOM_HORIZON):
+        night = today + timedelta(days=i)
+        held = sum(len(b.lines.all()) for b in bookings if b.check_in <= night < b.check_out)
+        forecast.append({"date": night.isoformat(), "rooms": held,
+                         "pct": round(min(100, held / len(rooms) * 100)) if rooms else 0})
+
+    total = len(rooms)
+    return {
+        "total": total, "occupied": len(occupied_by), "pct": round(len(occupied_by) / total * 100) if total else 0,
+        "vacant": sum(1 for t in tiles if t["state"] == "vacant"),
+        "cleaning": sum(1 for t in tiles if t["status"] == Room.Status.CLEANING),
+        "maintenance": sum(1 for t in tiles if t["status"] == Room.Status.MAINTENANCE),
+        "tiles": tiles, "forecast": forecast, "statuses": [{"value": v, "label": l, "out": v == Room.Status.MAINTENANCE} for v, l in Room.Status.choices],
+        "arrivals": late + arrivals, "departures": departures, "upcoming": upcoming[:6], "in_house": len(in_house),
+        "unsettled": [r for r in in_house if r["pay"] != "PAID"],
+    }
+
+
+def _insights(k):
+    """Plain-language findings, worst first. `k` holds the raw numbers collected by _dashboard_payload."""
+    out = []
+
+    def add(tone, title, text, href="", cta=""):
+        out.append({"tone": tone, "title": title, "text": text, "href": href, "cta": cta})
+
+    # sales
+    if k["delta"] is not None:
+        if k["delta"] >= 5:
+            add("good", f"Sales are up {k['delta']:.0f}% on yesterday", f"{_money_text(k['today_total'])} so far, against {_money_text(k['yday_total'])} by this time yesterday.")
+        elif k["delta"] <= -5:
+            add("warn", f"Sales are down {abs(k['delta']):.0f}% on yesterday", f"{_money_text(k['today_total'])} so far, against {_money_text(k['yday_total'])} by this time yesterday.")
+    elif k["today_bills"] == 0 and k["hour"] >= 11:
+        add("info", "No paid bills yet today", "Sales appear here as soon as the first bill is settled.")
+    if k["peak_hour"] is not None:
+        add("info", f"Busiest hour: {_hour_label(k['peak_hour'])}", f"About {k['peak_share']:.0f}% of daily sales land in this hour over the last {TREND_DAYS} days. Plan breaks and prep around it.")
+    if k["top_item"]:
+        t = k["top_item"]
+        add("info", f"{t['name']} leads the week", f"{t['qty']:,.0f} sold for {_money_text(t['amount'])} in the last 7 days.")
+
+    # stock
+    if k["out_count"]:
+        add("bad", f"{k['out_count']} item{'s' if k['out_count'] != 1 else ''} out of stock", "Sales that use these items may be blocked or push stock negative.", k["urls"]["low"], "Review low stock")
+    elif k["low_count"]:
+        add("warn", f"{k['low_count']} item{'s' if k['low_count'] != 1 else ''} at or below reorder level", "Order before they run out.", k["urls"]["low"], "Review low stock")
+    if k["low_count"] and k["draft_lpos"]:
+        add("warn", f"{k['draft_lpos']} draft LPO{'s' if k['draft_lpos'] != 1 else ''} not sent", "Suppliers can't deliver until the LPO is marked as sent.", k["urls"]["drafts"], "Send LPOs")
+    elif k["low_count"] and not k["awaiting"]:
+        add("warn", "Nothing is on order", "Stock is running low and no LPO is waiting for delivery.", k["urls"]["lpo_new"], "Create LPO")
+    if k["no_recipe"]:
+        add("warn", f"{k['no_recipe']} tracked dish{'es' if k['no_recipe'] != 1 else ''} without a recipe", "Selling them doesn't deduct ingredients, so stock counts drift.", k["urls"]["no_recipe"], "Add recipes")
+    if k["mtd_total"] and k["spent_month"]:
+        ratio = float(k["spent_month"] / k["mtd_total"] * 100)
+        add("warn" if ratio > 60 else "info", f"Purchases are {ratio:.0f}% of sales this month", f"{_money_text(k['spent_month'])} bought against {_money_text(k['mtd_total'])} sold.", k["urls"]["purchases"], "View purchases")
+
+    # control
+    if k["stale_count"]:
+        add("warn", f"{k['stale_count']} bill{'s' if k['stale_count'] != 1 else ''} unpaid for over {STALE_BILL_HOURS} hours", f"{_money_text(k['stale_amount'])} is still to be collected.", k["urls"]["bills"], "Open bills")
+    if k["voids_today"] >= max(3, 2 * k["voids_avg"]):
+        add("warn", f"{k['voids_today']} voids today", f"That is well above the usual {k['voids_avg']:.1f} a day.", k["urls"]["voids"], "Review voids")
+
+    # rooms
+    r = k["rooms"]
+    if r["total"]:
+        for a in r["arrivals"]:
+            if a["not_ready"]:
+                add("warn", f"{a['guest']} is due but {', '.join(a['not_ready'])} isn't ready", "Mark the room ready once it's cleaned so the guest can check in.")
+                break
+        owing = [x for x in r["departures"] if x["pay"] != "PAID"]
+        if owing:
+            names = ", ".join(x["guest"] for x in owing[:2]) + (f" and {len(owing) - 2} more" if len(owing) > 2 else "")
+            add("bad", f"{len(owing)} departing guest{'s' if len(owing) != 1 else ''} still to pay", f"{names}. Check-out needs the bill paid in full.")
+        overdue = [x for x in r["departures"] if x.get("overdue")]
+        if overdue:
+            add("warn", f"{len(overdue)} guest{'s' if len(overdue) != 1 else ''} past check-out date", "Check them out or extend the stay.")
+        week = sum(f["pct"] for f in r["forecast"]) / len(r["forecast"])
+        if week < 30:
+            add("info", f"Rooms are {week:.0f}% booked over the next {ROOM_HORIZON} nights", "Quiet week ahead. A good time for maintenance or a promotion.")
+        elif week >= 85:
+            add("good", f"Rooms are {week:.0f}% booked over the next {ROOM_HORIZON} nights", "Almost full. Keep housekeeping turnaround tight.")
+
+    order = {"bad": 0, "warn": 1, "good": 2, "info": 3}
+    out.sort(key=lambda x: order[x["tone"]])
+    return out[:7]
+
+
+def _dashboard_payload():
+    now = timezone.now()
+    today = timezone.localdate(now)
+    day_start = _midnight(today)
+    day_end = day_start + timedelta(days=1)
+    month_start = today.replace(day=1)
+    prev_start = (month_start - timedelta(days=1)).replace(day=1)
+    prev_end = min(prev_start + timedelta(days=today.day), month_start)
+
+    # ---- sales ----
+    today_total, today_bills = _sales(day_start, day_end)
+    yday_total, _n = _sales(_midnight(today - timedelta(days=1)), now - timedelta(days=1))   # same time yesterday
+    mtd_total, mtd_bills = _sales(_midnight(month_start), day_end)
+    prev_total, _n = _sales(_midnight(prev_start), _midnight(prev_end))
+    mtd_rooms = _paid(_midnight(month_start), day_end).filter(booking__isnull=False).aggregate(t=Sum("total"))["t"] or D(0)
+    hourly_total = _hours(_midnight(today - timedelta(days=TREND_DAYS)), day_start)
+    peak = max(range(24), key=lambda h: hourly_total[h]) if any(hourly_total) else None
+    sellers = _sellers(_midnight(today - timedelta(days=6)), day_end)
+
+    # ---- control ----
+    logs = AuditLog.objects.filter(created_at__gte=_midnight(today - timedelta(days=TREND_DAYS)))
+    voids_today = logs.filter(action="item_voided", created_at__gte=day_start).count()
+    voids_before = logs.filter(action="item_voided", created_at__lt=day_start).count()
+    discounts_today = logs.filter(action__in=["discount_given", "discount_applied"], created_at__gte=day_start).count()
+
+    # ---- live operations ----
+    occupying = Order.objects.filter(status__in=Order.OCCUPYING)
+    oldest = occupying.order_by("created_at").values_list("created_at", flat=True).first()
+    open_bills = Bill.objects.filter(status=Bill.Status.OPEN)
+    owed_expr = _money(F("total") - F("amount_paid"))
+    owed = open_bills.aggregate(t=Sum(owed_expr), n=Count("id"))
+    stale = open_bills.filter(created_at__lt=now - timedelta(hours=STALE_BILL_HOURS)).aggregate(t=Sum(owed_expr), n=Count("id"))
+    role_names = dict(ShiftAssignment.Role.choices)
+    crew = list(ShiftAssignment.objects.filter(ended_at__isnull=True, shift__status=Shift.Status.OPEN)
+                .select_related("user").order_by("role", "user__username"))
+
+    # ---- stock and buying ----
+    low = _items_with_stock().filter(is_active=True, reorder_level__gt=0, on_hand_total__lte=F("reorder_level"))
+    low_count = low.count()
+    out_count = low.filter(on_hand_total__lte=0).count()
+    low_items = []
+    for i in low.order_by("on_hand_total")[:8]:
+        have, need = _f(i.on_hand_total), _f(i.reorder_level)
+        low_items.append({"name": i.name, "have": have, "level": need, "unit": i.stock_unit, "out": have <= 0,
+                          "pct": round(min(100, max(0, have / need * 100))) if need else 0,
+                          "url": reverse("manager:item_detail", args=[i.pk])})
+    draft_lpos = PurchaseOrder.objects.filter(status=PS.DRAFT).exclude(number__startswith=DIRECT_PREFIX).count()
+    awaiting = PurchaseOrder.objects.filter(status__in=[PS.SENT, PS.PARTIAL]).exclude(number__startswith=DIRECT_PREFIX).count()
+    takes_open = StockTake.objects.filter(status=StockTake.Status.DRAFT).count()
+    spent = GoodsReceiptLine.objects.filter(receipt__created_at__gte=_midnight(month_start)).aggregate(
+        t=Sum(_money(F("qty") * F("unit_cost"))))["t"] or D(0)
+    stock_value = StockBalance.objects.filter(item__is_active=True).aggregate(
+        t=Sum(_money(F("quantity") * F("item__avg_cost"))))["t"] or D(0)
+    no_recipe = MenuItem.objects.filter(track_stock=True, recipe_lines__isnull=True).count()
+
+    rooms = _rooms_block(today)
+    urls = {"low": reverse("manager:balances") + "?low=1", "drafts": reverse("manager:lpos") + "?status=DRAFT",
+            "lpo_new": reverse("manager:lpo_new"), "receive": reverse("manager:receive"), "purchases": reverse("manager:purchases"),
+            "takes": reverse("manager:stock_takes"), "bills": reverse("manager:discounts"), "voids": reverse("manager:voids"),
+            "no_recipe": reverse("manager:recipes") + "?missing=1", "purchase_new": reverse("manager:purchase_new"),
+            "issue": reverse("manager:issue"), "reports": reverse("manager:reports")}
+
+    top = sellers["items"][0] if sellers["items"] else None
+    delta = _change(today_total, yday_total) if yday_total else None
+    insights = _insights({
+        "today_total": today_total, "today_bills": today_bills, "yday_total": yday_total, "delta": delta,
+        "hour": timezone.localtime(now).hour, "peak_hour": peak,
+        "peak_share": float(hourly_total[peak] / sum(hourly_total) * 100) if peak is not None else 0,
+        "top_item": top, "low_count": low_count, "out_count": out_count, "draft_lpos": draft_lpos, "awaiting": awaiting,
+        "no_recipe": no_recipe, "mtd_total": mtd_total, "spent_month": spent, "stale_count": stale["n"] or 0,
+        "stale_amount": stale["t"] or D(0), "voids_today": voids_today, "voids_avg": voids_before / TREND_DAYS,
+        "rooms": rooms, "urls": urls})
+
+    return {
+        "generated": timezone.localtime(now).isoformat(), "currency": CURRENCY, "today": today.isoformat(),
+        "hour": timezone.localtime(now).hour, "month_start": month_start.isoformat(),
+        "sales": {"today": _f(today_total), "bills": today_bills, "average": _f(today_total / today_bills) if today_bills else 0,
+                  "yesterday_same_time": _f(yday_total), "delta": delta,
+                  "mtd": _f(mtd_total), "mtd_bills": mtd_bills, "mtd_rooms": _f(mtd_rooms), "mtd_food": _f(mtd_total - mtd_rooms),
+                  "prev_mtd": _f(prev_total), "mtd_delta": _change(mtd_total, prev_total)},
+        "trend": _trend(today),
+        "hourly": {"today": _hours(day_start, day_end), "typical": [round(x / TREND_DAYS, 2) for x in hourly_total]},
+        "methods": _methods(day_start, day_end),
+        "sellers": sellers,
+        "live": {"open_orders": occupying.count(), "oldest_minutes": int((now - oldest).total_seconds() // 60) if oldest else None,
+                 "tables_busy": occupying.filter(table__isnull=False).values("table").distinct().count(),
+                 "tables_total": Table.objects.count(),
+                 "bills_open": owed["n"] or 0, "bills_owed": _f(owed["t"]), "bills_stale": stale["n"] or 0, "stale_hours": STALE_BILL_HOURS,
+                 "crew": [{"name": a.user.get_full_name() or a.user.username, "role": role_names.get(a.role, str(a.role).title()),
+                           "terminal": a.terminal or ""} for a in crew[:12]], "crew_total": len(crew)},
+        "stock": {"low_count": low_count, "out_count": out_count, "low_items": low_items, "draft_lpos": draft_lpos,
+                  "awaiting": awaiting, "takes_open": takes_open, "spent_month": _f(spent), "value": _f(stock_value),
+                  "voids_today": voids_today, "discounts_today": discounts_today, "open_bills": open_bills.count()},
+        "rooms": rooms, "insights": insights, "urls": urls,
+    }
+
 
 @manager_required
 def dashboard(request):
-    today = timezone.localdate()
-    month_start = today.replace(day=1)
-    stock = _items_with_stock().filter(is_active=True)
-    low = stock.filter(reorder_level__gt=0, on_hand_total__lte=F("reorder_level"))
-    spent = GoodsReceiptLine.objects.filter(receipt__created_at__date__gte=month_start).aggregate(
-        t=Sum(_money(F("qty") * F("unit_cost"))))["t"] or D(0)
-    logs = AuditLog.objects.filter(created_at__date=today)
-    ctx = {
-        "low_count": low.count(), "low_items": low.order_by("on_hand_total")[:8],
-        "draft_lpos": PurchaseOrder.objects.filter(status=PS.DRAFT).exclude(number__startswith=DIRECT_PREFIX).count(),
-        "awaiting": PurchaseOrder.objects.filter(status__in=[PS.SENT, PS.PARTIAL]).exclude(
-            number__startswith=DIRECT_PREFIX).count(),
-        "takes_open": StockTake.objects.filter(status=StockTake.Status.DRAFT).count(),
-        "voids_today": logs.filter(action="item_voided").count(),
-        "discounts_today": logs.filter(action__in=["discount_given", "discount_applied"]).count(),
-        "open_bills": Bill.objects.filter(status=Bill.Status.OPEN).count(),
-        "spent_month": spent, "month": month_start,
-    }
-    return _page(request, "dashboard.html", ctx)
+    payload = _dashboard_payload()
+    s = payload["stock"]
+    return _page(request, "dashboard.html", {
+        "payload": payload, "low_count": s["low_count"], "draft_lpos": s["draft_lpos"], "awaiting": s["awaiting"],
+        "takes_open": s["takes_open"], "open_bills": s["open_bills"], "voids_today": s["voids_today"],
+        "discounts_today": s["discounts_today"]})
+
+
+@manager_required
+@never_cache
+def dashboard_data(request):
+    """The same numbers as the page, as JSON. manager.js polls this to keep the dashboard live."""
+    return JsonResponse(_dashboard_payload())
+
+
+# ---- room actions from the dashboard (same services as the POS; a manager needs no open shift) ----
+
+@manager_required
+@require_POST
+def room_status_action(request, pk):
+    room = get_object_or_404(Room, pk=pk)
+    _, ok = _try(request, lambda: set_room_status(room=room, user=request.user, status=request.POST.get("status", "")))
+    if ok:
+        messages.success(request, f"{room.name} is now {room.get_status_display().lower()}.")
+    return _back(request, reverse("manager:dashboard"))
+
+
+@manager_required
+@require_POST
+def booking_action(request, pk, action):
+    booking = get_object_or_404(RoomBooking.objects.prefetch_related("lines__room"), pk=pk)
+    rooms = ", ".join(l.room.name for l in booking.lines.all())
+    if action == "check-in":
+        run, done = (lambda: check_in_booking(booking=booking, user=request.user)), f"{booking.guest_name} is checked in to {rooms}."
+    elif action == "check-out":
+        run, done = (lambda: check_out_booking(booking=booking, user=request.user)), f"{booking.guest_name} is checked out. {rooms} now needs cleaning."
+    else:
+        raise Http404("Unknown action")
+    _, ok = _try(request, run)
+    if ok:
+        messages.success(request, done)
+    return _back(request, reverse("manager:dashboard"))
+
 
 
 # =============================================================================

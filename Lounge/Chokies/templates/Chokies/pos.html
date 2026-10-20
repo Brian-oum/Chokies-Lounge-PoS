@@ -2,7 +2,7 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Nova PoS</title>
 <link rel="stylesheet" href="{% static 'css/pos.css' %}"></head>
-<body data-role="waiter">
+<body data-role="waiter" data-login-url="{{ login_url|default:'/pin-login/' }}">
 {% csrf_token %}{{ pos_user|json_script:"pos-user" }}
 
 <!-- payment icons: card / M-Pesa marks are simplified; swap in the official artwork from each brand's asset portal if you need exact logos -->
@@ -19,16 +19,6 @@
   <symbol id="i-till" viewBox="0 0 24 24"><path d="M4 9h16l-1.2-4.5H5.2zM5 9v10h14V9M9.5 19v-5h5v5"/></symbol>
   <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 4.5h18l-7 8.2V19l-4 2v-8.3z" fill="currentColor" stroke="none"/></symbol>
 </svg>
-
-<!-- ============ LOGIN ============ -->
-<section id="login" class="login hidden"><div class="login-card">
-  <div class="brand big"><span class="logo">C</span><div><b>Nova PoS</b><small>Sign in with your PIN</small></div></div>
-  <div id="roster" class="roster"></div>
-  <input id="uname" placeholder="Username" autocomplete="username" autocapitalize="none">
-  <div id="dots" class="dots"></div><div id="loginErr" class="err" role="alert"></div>
-  <div id="pad" class="pad"></div>
-  <p class="hint">Waiters and cashiers appear above while their shift is open. Managers: type your username.</p>
-</div></section>
 
 <!-- ============ TOP BAR + MAIN NAV (tabs depend on the role; built in pos.js buildNav) ============ -->
 <header class="top">
@@ -80,7 +70,7 @@
   <!-- Open orders (waiter + cashier) and Paid bills (cashier) pages: replace the home / desk while their tab is selected -->
   <section id="ordersPage" class="opage" aria-labelledby="opTitle">
     <div class="pcard filters">
-      <p class="pc-cap">Filter by date range</p>
+      <p id="fCap" class="pc-cap">Filter by date range</p>
       <div class="frow">
         <label>Selling point <span class="req">*</span><select id="fSp"></select></label>
         <label class="c-only">Waiter<select id="fWaiter"></select></label>
@@ -91,7 +81,7 @@
       </div>
     </div>
     <div class="pcard tablecard">
-      <div class="pc-head"><h2 id="opTitle">Open orders</h2><div id="opNew" class="pc-actions w-only"></div></div>
+      <div class="pc-head"><h2 id="opTitle">Open orders</h2><div id="opNew" class="pc-actions"></div></div>
       <div class="pc-tools">
         <label>Show <select id="opSize"><option>10</option><option>25</option><option>50</option><option>100</option></select> entries</label>
         <label>Search: <input id="opSearch" type="search" autocomplete="off"></label>
@@ -109,6 +99,71 @@
       <div id="ipActions" class="ip-actions"></div>
     </div>
     <article id="ipBody" class="pcard inv"></article>
+  </section>
+
+
+  <!-- Book room: room finder (left) + booking form (right). Built in pos.js (ROOMS). Billing and payment reuse the bill + payment dialog. -->
+  <section id="bookPage" class="bpage" aria-label="Book a room">
+    <div class="pcard rfinder">
+      <select id="bkScope" aria-label="Which rooms to list"><option value="free">Unoccupied rooms</option><option value="busy">Occupied rooms</option><option value="all">All rooms</option></select>
+      <div class="rf-dates">
+        <label><span>From date <span class="req">*</span></span><input id="bkFrom" type="date"></label>
+        <label><span>To date <span class="req">*</span></span><input id="bkTo" type="date"></label>
+        <button id="bkSearch" type="button" class="btn outline sm">Search</button>
+      </div>
+      <p id="bkCount" class="rf-count"></p>
+      <div class="tablewrap2"><table class="rtable"><thead><tr><th>Room</th><th>Meal plan <small class="inl">per night</small></th><th class="num">Action</th></tr></thead><tbody id="bkRooms"></tbody></table></div>
+    </div>
+
+    <form id="bkForm" class="pcard bform" autocomplete="off" novalidate>
+      <div class="pc-head"><h2>Booking form</h2><span class="bk-clock"><span id="bkClock"></span></span></div>
+      <div class="bf-body">
+        <div class="bf-find"><button id="bkFind" type="button" class="btn dark sm">Find customer</button></div>
+        <div class="bf-grid">
+          <label><span>Nights <span class="req">*</span></span><input id="bkNights" readonly></label>
+          <label><span>Full name <span class="req">*</span></span><input id="bkName" maxlength="150" placeholder="Customer name"></label>
+          <label><span>Phone <span class="req">*</span></span><input id="bkPhone" type="tel" inputmode="tel" maxlength="30" placeholder="07123…"></label>
+          <label><span>Occupants <span class="req">*</span> <em>(per room)</em></span><input id="bkOcc" type="number" min="1" max="20" value="1" inputmode="numeric"></label>
+          <label class="wide">Narrative<textarea id="bkNote" rows="2" maxlength="300" placeholder="Organization / company / other profile details…"></textarea></label>
+        </div>
+        <div class="inv-scroll"><table class="blines"><thead><tr><th>Room description</th><th>Meal plan</th><th class="num">Unit price</th><th class="num">Total amount</th><th><span class="sr">Remove</span></th></tr></thead><tbody id="bkLines"></tbody></table></div>
+        <div class="bf-sum">
+          <label><span>Tax (<span id="bkVatP">VAT</span>)</span><output id="bkVat">0.00</output></label>
+          <label><span><abbr title="Catering levy">CTL</abbr> (<span id="bkLevyP"></span>)</span><output id="bkLevy">0.00</output></label>
+          <label>Total<output id="bkTotal" class="big">0.00</output></label>
+        </div>
+        <div class="bf-pay">
+          <label>Amount paid<input id="bkPaid" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00"></label>
+          <label>Payment method
+            <select id="bkMethod"><option value="">Select payment method</option><option value="CASH">Cash</option><option value="MOBILE_MONEY">M-Pesa</option><option value="CARD">Card</option><option value="TRANSFER">Bank transfer</option><option value="VOUCHER">Voucher</option></select></label>
+          <label><span>Reference <span id="bkRefReq" class="req hidden">*</span></span><input id="bkRef" autocomplete="off" placeholder="Reference"></label>
+          <label class="due-l">Balance<output id="bkBal">0.00</output></label>
+          <label>Change return<output id="bkChg">0.00</output></label>
+        </div>
+        <div class="bf-foot"><p id="bkHint" class="ohint"></p>
+          <div class="row2"><button id="bkClear" type="button" class="btn ghost">Clear</button><button id="bkSubmit" type="submit" class="btn primary">Book room</button></div></div>
+      </div>
+    </form>
+  </section>
+
+  <!-- Booking page: one stay laid out like an invoice. Opened from Bookings, Book room or a paid room bill; the URL becomes #/booking/<id>. -->
+  <section id="bookingPage" class="kpage" aria-label="Booking details">
+    <div class="ibar">
+      <div class="ibar-top"><button id="kpBack" type="button" class="btn ghost sm">← Back</button><span class="grow"></span><small id="kpPrepared"></small></div>
+      <div id="kpActions" class="ip-actions"></div>
+    </div>
+    <article id="kpBody" class="pcard inv"></article>
+  </section>
+
+  <!-- Online bookings. The channel connection is built later; see ONLINE in pos.js. -->
+  <section id="onlinePage" class="onpage" aria-label="Online bookings">
+    <div class="pcard tablecard">
+      <div class="pc-head"><h2>Online bookings</h2></div>
+      <div id="onStats" class="dstats"></div>
+      <div class="pc-tools"><span></span><label>Search: <input id="onSearch" type="search" autocomplete="off"></label></div>
+      <div class="tablewrap2"><table class="dtable otable"><thead id="onHead"></thead><tbody id="onBody"></tbody></table></div>
+      <div class="pc-foot"><span id="onInfo" class="muted"></span></div>
+    </div>
   </section>
 
   <!-- ticket: the cashier's inline order panel on the desk (hidden for waiters, who use the order page below) -->
@@ -138,6 +193,12 @@
   <div class="dtools"><input id="dSearch" class="search" type="search" placeholder="Search…" autocomplete="off"></div>
   <div class="tablewrap"><table class="dtable"><thead id="dHead"></thead><tbody id="dBody"></tbody><tfoot id="dFoot"></tfoot></table></div>
 </dialog>
+
+<!-- Book room: find a guest from an earlier booking -->
+<dialog id="guestDlg" aria-labelledby="gTitle"><h3 id="gTitle">Find customer</h3>
+  <input id="gSearch" class="search" type="search" placeholder="Search name or phone…" autocomplete="off">
+  <div id="gList" class="glist"></div>
+  <div class="row2"><button id="gClose" type="button" class="btn ghost">Close</button></div></dialog>
 
 <!-- generic prompt (see ask() in core.js) -->
 <dialog id="dlg"><form method="dialog"><h3 id="dlgTitle"></h3><div id="dlgBody" class="fields"></div>
