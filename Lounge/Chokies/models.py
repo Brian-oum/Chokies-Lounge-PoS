@@ -20,6 +20,7 @@ from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
+from django.utils.crypto import salted_hmac
 from django.db import models, transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
@@ -65,6 +66,10 @@ class AuthFailed(DomainError):
 
 class PinLocked(DomainError):
     status_code = 429
+
+
+class RoomUnavailable(DomainError):
+    status_code = 409
 
 
 # =============================================================================
@@ -138,12 +143,28 @@ class User(AbstractUser):
 
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.WAITER)
     pin_hash = models.CharField(max_length=128, blank=True)
+    # Keyed fingerprint of the PIN so the login page can find the person from the PIN alone.
+    # Unique: no two people may share a PIN. Empty until the PIN is (re)set or the person next signs in.
+    pin_lookup = models.CharField(max_length=64, null=True, blank=True, unique=True, editable=False)
     failed_pin_attempts = models.PositiveSmallIntegerField(default=0)
     pin_locked_until = models.DateTimeField(null=True, blank=True)
     # Bumped on logout / PIN change: every token issued earlier stops working.
     token_version = models.PositiveIntegerField(default=0)
 
+    @staticmethod
+    def pin_fingerprint(raw_pin) -> str:
+        return salted_hmac("chokies.pin.lookup", str(raw_pin), algorithm="sha256").hexdigest()
+
     def set_pin(self, raw_pin: str):
+        """Set this person's PIN. PINs identify people at sign-in, so a PIN already used by someone else is refused."""
+        raw_pin = str(raw_pin)
+        fp = self.pin_fingerprint(raw_pin)
+        taken = User.objects.filter(pin_lookup=fp).exclude(pk=self.pk).exists() or any(
+            o.check_pin(raw_pin)      # people whose PIN predates pin_lookup
+            for o in User.objects.filter(pin_lookup__isnull=True).exclude(pin_hash="").exclude(pk=self.pk))
+        if taken:
+            raise ValidationError({"pin": "That PIN is already used by someone else. Choose a different one."})
+        self.pin_lookup = fp
         self.pin_hash = make_password(raw_pin)
         self.failed_pin_attempts = 0
         self.pin_locked_until = None
@@ -672,7 +693,9 @@ class Bill(TimeStamped):
         REFUNDED = "REFUNDED", "Refunded"
 
     number = models.CharField(max_length=20, unique=True)  # gap-free per terminal, never deleted
-    order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name="bills")
+    # A bill belongs to exactly ONE of: an order (restaurant / bar) or a room booking (accommodation).
+    order = models.ForeignKey(Order, null=True, blank=True, on_delete=models.PROTECT, related_name="bills")
+    booking = models.ForeignKey("RoomBooking", null=True, blank=True, on_delete=models.PROTECT, related_name="bills")
     terminal = models.CharField(max_length=10)
     lines = models.JSONField(default=list)  # immutable receipt snapshot
     subtotal = models.DecimalField("Net", max_digits=12, decimal_places=2)
@@ -681,6 +704,7 @@ class Bill(TimeStamped):
     discount_approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
                                              on_delete=models.PROTECT, related_name="+")
     service_charge = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    levy = models.DecimalField("Catering levy", max_digits=12, decimal_places=2, default=0)  # room bills only
     tax = models.DecimalField(max_digits=12, decimal_places=2)
     total = models.DecimalField(max_digits=12, decimal_places=2)
     amount_paid = models.DecimalField("Paid (net of refunds)", max_digits=12, decimal_places=2, default=0)
@@ -699,10 +723,17 @@ class Bill(TimeStamped):
     class Meta:
         ordering = ["-created_at"]
         constraints = [models.UniqueConstraint(fields=["order"], condition=Q(status__in=["OPEN", "PAID"]),
-                                               name="one_live_bill_per_order")]
+                                               name="one_live_bill_per_order"),
+                       models.UniqueConstraint(fields=["booking"], condition=Q(status__in=["OPEN", "PAID"]),
+                                               name="one_live_bill_per_booking")]
 
     def __str__(self):
         return self.number
+
+    @property
+    def document(self):
+        """The order or room booking this bill is for."""
+        return self.order if self.order_id else self.booking
 
     @property
     def balance(self) -> Decimal:
@@ -759,3 +790,93 @@ class ZReport(models.Model):
 
     def delete(self, *args, **kwargs):
         raise RuntimeError("Z reports cannot be deleted")
+
+
+# =============================================================================
+# Rooms: accommodation booked by waiters / cashiers, billed and paid like an order
+# =============================================================================
+
+class MealPlan(models.TextChoices):
+    BO = "BO", "Bed only"
+    BNB = "BNB", "Bed & breakfast"
+    HB = "HB", "Half board"
+    FB = "FB", "Full board"
+
+
+class Room(TimeStamped):
+    """A bookable room. Whether it is occupied is NOT stored: it comes from the bookings that overlap the dates.
+    `status` is only the housekeeping state (ready / being cleaned / out of service)."""
+    class Status(models.TextChoices):
+        AVAILABLE = "AVAILABLE", "Ready"
+        CLEANING = "CLEANING", "Being cleaned"
+        MAINTENANCE = "MAINTENANCE", "Out of service"
+
+    name = models.CharField(max_length=60, unique=True, help_text="e.g. DELUXE 001")
+    room_type = models.CharField(max_length=60, blank=True, help_text="e.g. Executive, Superior, Studio")
+    capacity = models.PositiveSmallIntegerField(default=2, help_text="Guests per room")
+    # Price per night for each meal plan. A rate of 0 means the plan is not offered for this room.
+    rate_bo = models.DecimalField("Bed only", max_digits=10, decimal_places=2, default=0)
+    rate_bnb = models.DecimalField("Bed & breakfast", max_digits=10, decimal_places=2, default=0)
+    rate_hb = models.DecimalField("Half board", max_digits=10, decimal_places=2, default=0)
+    rate_fb = models.DecimalField("Full board", max_digits=10, decimal_places=2, default=0)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.AVAILABLE)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def rates(self):
+        return {MealPlan.BO: self.rate_bo, MealPlan.BNB: self.rate_bnb, MealPlan.HB: self.rate_hb, MealPlan.FB: self.rate_fb}
+
+    def rate(self, plan):
+        return self.rates.get(plan, Decimal(0))
+
+
+class RoomBooking(TimeStamped):
+    """One guest, one stay, one or more rooms, one bill. Nights run from check_in up to (not including) check_out."""
+    class Status(models.TextChoices):
+        RESERVED = "RESERVED", "Reserved"
+        CHECKED_IN = "CHECKED_IN", "Checked in"
+        CHECKED_OUT = "CHECKED_OUT", "Checked out"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    ACTIVE = (Status.RESERVED, Status.CHECKED_IN)   # these hold their rooms
+
+    number = models.CharField(max_length=20, unique=True)
+    guest_name = models.CharField(max_length=150)
+    phone = models.CharField(max_length=30)
+    occupants = models.PositiveSmallIntegerField(default=1, help_text="Guests per room")
+    narrative = models.CharField(max_length=300, blank=True, help_text="Organisation / company / other profile details")
+    check_in = models.DateField()
+    check_out = models.DateField()
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.RESERVED)
+    shift = models.ForeignKey(Shift, null=True, blank=True, on_delete=models.PROTECT, related_name="bookings")
+    booked_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="bookings")
+    checked_in_at = models.DateTimeField(null=True, blank=True)
+    checked_out_at = models.DateTimeField(null=True, blank=True)
+    cancel_reason = models.CharField(max_length=200, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["check_in", "check_out"])]
+
+    def __str__(self):
+        return self.number
+
+    @property
+    def nights(self) -> int:
+        return max(1, (self.check_out - self.check_in).days)
+
+
+class RoomBookingLine(models.Model):
+    booking = models.ForeignKey(RoomBooking, on_delete=models.CASCADE, related_name="lines")
+    room = models.ForeignKey(Room, on_delete=models.PROTECT, related_name="booking_lines")
+    meal_plan = models.CharField(max_length=3, choices=MealPlan.choices, default=MealPlan.BO)
+    unit_price = models.DecimalField("Price per night", max_digits=10, decimal_places=2)   # snapshot: later rate changes never touch it
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["booking", "room"], name="one_line_per_room_per_booking")]

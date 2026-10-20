@@ -8,6 +8,11 @@ app_name = "manager"
 
 urlpatterns = [
     path("", m.dashboard, name="dashboard"),
+    path("dashboard/data/", m.dashboard_data, name="dashboard_data"),                  # JSON feed the dashboard polls
+
+    # rooms (actions used by the dashboard)
+    path("rooms/<int:pk>/status/", m.room_status_action, name="room_status"),
+    path("bookings/<int:pk>/<str:action>/", m.booking_action, name="booking_action"),  # check-in | check-out
 
     # purchases + LPOs
     path("purchases/", m.purchases, name="purchases"),

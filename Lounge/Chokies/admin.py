@@ -19,7 +19,7 @@ from django.utils.html import format_html
 
 from Chokies.models import (KOT, AuditLog, Bill, CashMovement, Category, DocumentSequence, GoodsReceipt,
                         GoodsReceiptLine, Location, MenuItem, Modifier, Order, OrderItem, Payment,
-                        PurchaseOrder, PurchaseOrderLine, RecipeLine, Shift, ShiftAssignment, StockBalance, StockItem,
+                        PurchaseOrder, PurchaseOrderLine, RecipeLine, Room, RoomBooking, RoomBookingLine, Shift, ShiftAssignment, StockBalance, StockItem,
                         StockMovement, StockTake, StockTakeLine, Supplier, Table, User, ZReport)
 from Chokies.views import render_receipt
 
@@ -178,7 +178,7 @@ class PaymentInline(admin.TabularInline):
 
 PERIODS = {"day": (TruncDay, "%a %d %b %Y"), "week": (TruncWeek, "Week of %d %b %Y"),
            "month": (TruncMonth, "%B %Y"), "year": (TruncYear, "%Y")}
-MONEY = ("net", "tax", "service", "discounts", "total", "collected")
+MONEY = ("net", "tax", "service", "levy", "discounts", "total", "collected")
 
 # The two admin pages below are built from these strings, so no template files need to be copied anywhere.
 BILL_LIST_TEMPLATE = """{% extends "admin/change_list.html" %}
@@ -196,7 +196,9 @@ BILL_LIST_TEMPLATE = """{% extends "admin/change_list.html" %}
             <td>Net</td><td style="text-align:right">{{ sales.net|floatformat:2 }}</td></tr>
         <tr><td>VAT</td><td style="text-align:right">{{ sales.tax|floatformat:2 }}</td>
             <td>Service charge</td><td style="text-align:right">{{ sales.service|floatformat:2 }}</td></tr>
-        <tr><td>Discounts</td><td style="text-align:right">{{ sales.discounts|floatformat:2 }}</td>
+        <tr><td>Catering levy</td><td style="text-align:right">{{ sales.levy|floatformat:2 }}</td>
+            <td>Discounts</td><td style="text-align:right">{{ sales.discounts|floatformat:2 }}</td></tr>
+        <tr><td></td><td></td>
             <td><b>Total</b></td><td style="text-align:right;font-size:1.2em"><b>{{ sales.total|floatformat:2 }}</b></td></tr>
       </table>
     </div>
@@ -228,16 +230,16 @@ SALES_SUMMARY_TEMPLATE = """{% extends "admin/base_site.html" %}
 </form>
 <table style="width:100%">
   <thead><tr><th>Period</th><th style="text-align:right">Bills</th><th style="text-align:right">Net</th><th style="text-align:right">VAT</th>
-    <th style="text-align:right">Service</th><th style="text-align:right">Discounts</th><th style="text-align:right">Total</th><th style="text-align:right">Collected</th></tr></thead>
+    <th style="text-align:right">Service</th><th style="text-align:right">Levy</th><th style="text-align:right">Discounts</th><th style="text-align:right">Total</th><th style="text-align:right">Collected</th></tr></thead>
   <tbody>{% for r in rows %}
     <tr><td>{{ r.label }}</td><td style="text-align:right">{{ r.bills }}</td><td style="text-align:right">{{ r.net|floatformat:2 }}</td>
       <td style="text-align:right">{{ r.tax|floatformat:2 }}</td><td style="text-align:right">{{ r.service|floatformat:2 }}</td>
-      <td style="text-align:right">{{ r.discounts|floatformat:2 }}</td><td style="text-align:right"><b>{{ r.total|floatformat:2 }}</b></td>
+      <td style="text-align:right">{{ r.levy|floatformat:2 }}</td><td style="text-align:right">{{ r.discounts|floatformat:2 }}</td><td style="text-align:right"><b>{{ r.total|floatformat:2 }}</b></td>
       <td style="text-align:right">{{ r.collected|floatformat:2 }}</td></tr>
-  {% empty %}<tr><td colspan="8">No bills in this range.</td></tr>{% endfor %}</tbody>
+  {% empty %}<tr><td colspan="9">No bills in this range.</td></tr>{% endfor %}</tbody>
   <tfoot><tr style="font-weight:bold"><td>TOTAL</td><td style="text-align:right">{{ totals.bills }}</td><td style="text-align:right">{{ totals.net|floatformat:2 }}</td>
     <td style="text-align:right">{{ totals.tax|floatformat:2 }}</td><td style="text-align:right">{{ totals.service|floatformat:2 }}</td>
-    <td style="text-align:right">{{ totals.discounts|floatformat:2 }}</td><td style="text-align:right">{{ totals.total|floatformat:2 }}</td>
+    <td style="text-align:right">{{ totals.levy|floatformat:2 }}</td><td style="text-align:right">{{ totals.discounts|floatformat:2 }}</td><td style="text-align:right">{{ totals.total|floatformat:2 }}</td>
     <td style="text-align:right">{{ totals.collected|floatformat:2 }}</td></tr></tfoot>
 </table>
 <h3 style="margin-top:24px">Payments received by method (net of refunds)</h3>
@@ -251,7 +253,7 @@ def _template(source):
 
 
 def _sums(qs):
-    r = qs.order_by().aggregate(bills=Count("id"), net=Sum("subtotal"), tax=Sum("tax"), service=Sum("service_charge"),
+    r = qs.order_by().aggregate(bills=Count("id"), net=Sum("subtotal"), tax=Sum("tax"), service=Sum("service_charge"), levy=Sum("levy"),
                                 discounts=Sum("discount_amount"), total=Sum("total"), collected=Sum("amount_paid"))
     return {k: v or 0 for k, v in r.items()}
 
@@ -263,10 +265,10 @@ def _methods(qs):
 
 @admin.register(Bill)
 class BillAdmin(ReadOnly):
-    list_display = ("number", "order", "status", "total", "amount_paid", "created_at", "print_link")
+    list_display = ("number", "order", "booking", "status", "total", "amount_paid", "created_at", "print_link")
     list_filter = (("created_at", admin.DateFieldListFilter), "status", "terminal")  # Today / 7 days / month / year
     date_hierarchy = "created_at"                                                    # year > month > day drill-down
-    search_fields = ("number",)
+    search_fields = ("number", "booking__number", "booking__guest_name")
     inlines = [PaymentInline]
 
     @property
@@ -297,7 +299,7 @@ class BillAdmin(ReadOnly):
         return resp
 
     def receipt(self, request, pk):
-        bill = get_object_or_404(Bill.objects.select_related("order__table", "order__waiter"), pk=pk)
+        bill = get_object_or_404(Bill.objects.select_related("order__table", "order__waiter", "booking__booked_by"), pk=pk)
         if not self.has_view_permission(request, bill):
             raise PermissionDenied
         return HttpResponse(render_receipt(bill, autoprint=True))
@@ -317,7 +319,7 @@ class BillAdmin(ReadOnly):
         trunc, fmt = PERIODS[period]
         rows = [{**r, "label": r["p"].strftime(fmt)} for r in
                 qs.annotate(p=trunc("created_at")).values("p").annotate(
-                    bills=Count("id"), net=Sum("subtotal"), tax=Sum("tax"), service=Sum("service_charge"),
+                    bills=Count("id"), net=Sum("subtotal"), tax=Sum("tax"), service=Sum("service_charge"), levy=Sum("levy"),
                     discounts=Sum("discount_amount"), total=Sum("total"), collected=Sum("amount_paid")).order_by("-p")]
         totals = _sums(qs)
         if request.GET.get("format") == "csv":
@@ -394,3 +396,31 @@ class AuditLogAdmin(ReadOnly):
 
 
 admin.site.register(DocumentSequence)
+
+# ---- rooms: managers set up rooms and rates here; staff book them from the POS ----
+@admin.register(Room)
+class RoomAdmin(admin.ModelAdmin):
+    list_display = ("name", "room_type", "capacity", "rate_bo", "rate_bnb", "rate_hb", "rate_fb", "status", "is_active")
+    list_filter = ("status", "room_type", "is_active")
+    list_editable = ("status", "is_active")
+    search_fields = ("name", "room_type")
+    fieldsets = ((None, {"fields": ("name", "room_type", "capacity", "status", "is_active")}),
+                 ("Price per night (0 = not offered)", {"fields": ("rate_bo", "rate_bnb", "rate_hb", "rate_fb")}))
+
+
+class RoomBookingLineInline(admin.TabularInline):
+    model = RoomBookingLine
+    extra = 0
+    can_delete = False
+    readonly_fields = ("room", "meal_plan", "unit_price")
+    def has_add_permission(self, request, obj=None): return False
+
+
+@admin.register(RoomBooking)
+class RoomBookingAdmin(ReadOnly):
+    """Bookings change only through the POS (conflict checks, billing and payments live there)."""
+    list_display = ("number", "guest_name", "phone", "check_in", "check_out", "status", "booked_by", "created_at")
+    list_filter = ("status", ("check_in", admin.DateFieldListFilter))
+    search_fields = ("number", "guest_name", "phone")
+    date_hierarchy = "check_in"
+    inlines = [RoomBookingLineInline]
